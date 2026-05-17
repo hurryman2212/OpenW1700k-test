@@ -1,0 +1,38 @@
+From: Jihong Min <hurryman2212@gmail.com>
+Date: Tue, 26 May 2026 04:54:11 +0900
+Subject: [PATCH] netfilter: flowtable: preserve LAG output device in path walk
+
+The flowtable path walker already passes immutable post-NAT flow keys to
+fill_forward_path, allowing bonding to select the same slave as the
+transmit path. Once bonding exposes that slave, the resulting path also
+contains a DEV_PATH_LAG entry.
+
+Handle that entry as an Ethernet-like path step and preserve the LAG
+master as the software output device. Later path entries can then resolve
+the selected lower device used for hardware redirection without replacing
+the flow's software output interface.
+
+Assisted-by: Codex:gpt-5.6
+Signed-off-by: Jihong Min <hurryman2212@gmail.com>
+---
+diff --git a/net/netfilter/nf_flow_table_path.c b/net/netfilter/nf_flow_table_path.c
+--- a/net/netfilter/nf_flow_table_path.c
++++ b/net/netfilter/nf_flow_table_path.c
+@@ -151,12 +151,17 @@ static void nft_dev_path_info(const struct net_device_path_stack *stack,
+ 		case DEV_PATH_ETHERNET:
+ 		case DEV_PATH_DSA:
+ 		case DEV_PATH_VLAN:
++		case DEV_PATH_LAG:
+ 		case DEV_PATH_PPPOE:
+ 			if (is_zero_ether_addr(info->h_source))
+ 				memcpy(info->h_source, path->dev->dev_addr, ETH_ALEN);
+ 
+ 			if (path->type == DEV_PATH_ETHERNET)
+ 				break;
++			if (path->type == DEV_PATH_LAG) {
++				info->outdev = path->dev;
++				break;
++			}
+ 			if (path->type == DEV_PATH_DSA) {
+ 				i = stack->num_paths;
+ 				break;
