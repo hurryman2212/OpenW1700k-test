@@ -31,6 +31,8 @@ main() {
 
     mkdir -p "$RULES_DIR"
     cat > "$RULES_FILE" <<EOF
+destroy table bridge fw4
+
 table bridge fw4 {
     flowtable ${FLOWTABLE} {
         hook ingress priority 0; devices = { ${devices} }; flags offload;
