@@ -1,0 +1,30 @@
+From: Jihong Min <hurryman2212@gmail.com>
+Subject: [PATCH] wifi: mt76: keep NPU RRO data on its original RX queue
+
+RRO 3.0 data queues normally defer completed A-MSDUs to the indicator
+queue NAPI.  The Airoha NPU uses the same RRO queue flags, but completes
+those packets through the original data queue and does not provide the
+corresponding indicator activity.
+
+Keep NPU-owned RRO data on its original RX queue.  Otherwise the packets
+can remain queued until unrelated indicator activity occurs, severely
+reducing receive throughput on 6 GHz EHT320 links.
+
+Assisted-by: Codex:gpt-5.6
+Signed-off-by: Jihong Min <hurryman2212@gmail.com>
+---
+ mac80211.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+--- a/mac80211.c
++++ b/mac80211.c
+@@ -922,7 +922,8 @@ static void mt76_rx_release_amsdu(struct
+ 	/* RRO 3.0 data queue skbs are processed and completed in the context
+ 	 * of the indicator queue NAPI, which only polls its own skb list
+ 	 */
+-	if (mt76_queue_is_wed_rro_data(rxq) && dev->hwrro_mode == MT76_HWRRO_V3)
++	if (!mt76_npu_device_active(dev) &&
++	    mt76_queue_is_wed_rro_data(rxq) && dev->hwrro_mode == MT76_HWRRO_V3)
+ 		q = MT_RXQ_RRO_IND;
+ 
+ 	__skb_queue_tail(&dev->rx_skb[q], skb);
