@@ -674,18 +674,24 @@ endef
 $(eval $(call KernelPackage,airoha-npu))
 
 
+# SOE is linked into airoha-eth rather than shipped as a standalone module
+# because it shares the Ethernet driver's FE/QDMA rings and netdev lifetime.
 define KernelPackage/airoha-eth
   SUBMENU:=$(NETWORK_DEVICES_MENU)
   TITLE:=Airoha SoC Gigabit Ethernet support
-  DEPENDS:=@TARGET_airoha +kmod-airoha-npu +kmod-of-mdio
-  KCONFIG:=CONFIG_NET_AIROHA
+  DEPENDS:=@TARGET_airoha +kmod-airoha-npu +kmod-of-mdio \
+	+kmod-ipsec4-offload \
+	+IPV6:kmod-ipsec6-offload
+  KCONFIG:= \
+	CONFIG_NET_AIROHA \
+	CONFIG_NET_AIROHA_SOE
   FILES:=$(LINUX_DIR)/drivers/net/ethernet/airoha/airoha-eth.ko
   AUTOLOAD:=$(call AutoLoad,41,airoha-eth,1)
 endef
 
 define KernelPackage/airoha-eth/description
   Kernel module for Airoha SoC Gigabit Ethernet.
-  Includes PPE (Packet Processing Engine) for hardware offloading.
+  Includes PPE and SOE support for hardware flow and ESP offloading.
 endef
 
 $(eval $(call KernelPackage,airoha-eth))
