@@ -754,7 +754,7 @@ Signed-off-by: Lorenzo Bianconi <lorenzo@kernel.org>
 +	netdev->max_mtu = AIROHA_MAX_MTU;
 +	netdev->watchdog_timeo = 5 * HZ;
 +	netdev->hw_features = AIROHA_HW_FEATURES | NETIF_F_LRO;
-+	netdev->features |= AIROHA_HW_FEATURES;
++	netdev->features |= AIROHA_HW_FEATURES | NETIF_F_LRO;
 +	netdev->vlan_features = AIROHA_HW_FEATURES;
 +	netdev->dev.of_node = np;
 +	SET_NETDEV_DEV(netdev, eth->dev);
@@ -819,7 +819,7 @@ Signed-off-by: Lorenzo Bianconi <lorenzo@kernel.org>
 -	dev->max_mtu = AIROHA_MAX_MTU;
 -	dev->watchdog_timeo = 5 * HZ;
 -	dev->hw_features = AIROHA_HW_FEATURES | NETIF_F_LRO;
--	dev->features |= AIROHA_HW_FEATURES;
+-	dev->features |= AIROHA_HW_FEATURES | NETIF_F_LRO;
 -	dev->vlan_features = AIROHA_HW_FEATURES;
 -	dev->dev.of_node = np;
 -	SET_NETDEV_DEV(dev, eth->dev);

@@ -340,7 +340,7 @@ Signed-off-by: Lorenzo Bianconi <lorenzo@kernel.org>
  	netdev = devm_alloc_etherdev_mqs(eth->dev, sizeof(*dev),
 @@ -3372,7 +3376,6 @@ static int airoha_alloc_gdm_device(struc
  	netdev->hw_features = AIROHA_HW_FEATURES | NETIF_F_LRO;
- 	netdev->features |= AIROHA_HW_FEATURES;
+ 	netdev->features |= AIROHA_HW_FEATURES | NETIF_F_LRO;
  	netdev->vlan_features = AIROHA_HW_FEATURES;
 -	netdev->dev.of_node = np;
  	SET_NETDEV_DEV(netdev, eth->dev);
