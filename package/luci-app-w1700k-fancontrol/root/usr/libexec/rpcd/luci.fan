@@ -30,7 +30,7 @@ find_mt7996_hwmon() {
 	echo ""
 }
 
-# Dynamically find PHY hwmon devices (mt7530 DSA)
+# Dynamically find the RTL8261CE PHY hwmon devices behind the MT7530 DSA bus.
 find_phy_hwmon() {
 	local suffix="$1"  # :05 or :08
 	for hwmon in /sys/class/hwmon/hwmon*; do
@@ -80,7 +80,7 @@ get_status() {
 	# temp1 = board local (used by hardware fan curve), temp2 = external (disconnected), temp4 = external
 	temp_board=$(read_temp "${HWMON}/temp1_input")
 
-	# Read PHY temperatures from mt7530 DSA switch sensors (dynamic lookup)
+	# Read the two external RTL8261CE PHY temperatures.
 	local phy1_hwmon=$(find_phy_hwmon ":05")
 	local phy2_hwmon=$(find_phy_hwmon ":08")
 	temp_phy1=$([ -n "$phy1_hwmon" ] && read_temp "$phy1_hwmon/temp1_input" || echo 0)
