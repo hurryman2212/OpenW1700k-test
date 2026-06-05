@@ -1,6 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0 */
-/*
- * Register tables recovered from rtk-rtl8261ce-phy.ko module from the stock
+/* Register tables recovered from rtk-rtl8261ce-phy.ko module from the stock
  * LUMEN W1700K2 firmware.
  */
 

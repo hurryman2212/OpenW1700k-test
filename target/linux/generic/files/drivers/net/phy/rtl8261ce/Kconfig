@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: GPL-2.0-only
 config RTL8261CE_PHY
 	tristate "Realtek RTL8261CE PHY"
+	depends on HWMON
 	select PHY_COMMON_PROPS
 	help
 	  Enable support for the Realtek RTL8261CE 10GBASE-T PHY.

@@ -17,6 +17,7 @@
 #include <linux/bitfield.h>
 #include <linux/delay.h>
 #include <linux/ethtool.h>
+#include <linux/hwmon.h>
 #include <linux/kernel.h>
 #include <linux/mdio.h>
 #include <linux/mii.h>
@@ -94,8 +95,13 @@
 #define RTL8261CE_VND2_PATCH_DONE 0xa600
 #define RTL8261CE_VND2_AN_CTRL1000 0xa412
 #define RTL8261CE_VND2_AN_STAT1000 0xa414
-#define RTL8261CE_VND2_THERMAL_SENSOR_CTRL 0xb54c
-#define RTL8261CE_THERMAL_OVERTEMP_DWNSPD_EN BIT(3)
+#define RTL8261CE_VND2_TSALRM			0xa662
+#define RTL8261CE_VND2_TSRR			0xbd84
+#define RTL8261CE_VND2_THERMAL_SENSOR_CTRL	0xb54c
+#define RTL8261CE_THERMAL_OVERTEMP_DWNSPD_EN	BIT(3)
+#define RTL8261CE_THERMAL_ALARM_MASK		GENMASK(5, 0)
+#define RTL8261CE_THERMAL_RAW_MASK		GENMASK(9, 0)
+#define RTL8261CE_THERMAL_THRESHOLD_SHIFT	7
 #define RTL8261CE_INDIRECT_PATCH_VER 0x801e
 #define RTL8261CE_INDIRECT_PATCH_SETUP 0x8023
 #define RTL8261CE_VND2_EEE_CTRL0 0xd036
@@ -137,6 +143,83 @@ static const struct rtl8261ce_regval rtl8261ce_post_patch_seq[] = {
 	{ MDIO_MMD_VEND2, RTL8261CE_VND2_OCP_ADDR, 0x0000 },
 	{ MDIO_MMD_VEND2, RTL8261CE_VND2_OCP_DATA, 0x0000 },
 };
+
+static long rtl8261ce_hwmon_temp_from_raw(int raw)
+{
+	raw &= RTL8261CE_THERMAL_RAW_MASK;
+
+	/* The recovered RTL8261CE-specific decode under-reports temperature
+	 * on this board, so use the upstream RTL822x hwmon conversion: TSRR is
+	 * a signed 10-bit half-degree Celsius value.
+	 */
+	if (raw >= BIT(9))
+		raw -= BIT(10);
+	return raw * 500;
+}
+
+static int rtl8261ce_hwmon_read(struct device *dev,
+				enum hwmon_sensor_types type, u32 attr,
+				int channel, long *val)
+{
+	struct phy_device *phydev = dev_get_drvdata(dev);
+	int raw;
+
+	switch (attr) {
+	case hwmon_temp_input:
+		raw = phy_read_mmd(phydev, MDIO_MMD_VEND2, RTL8261CE_VND2_TSRR);
+		if (raw < 0)
+			return raw;
+
+		*val = rtl8261ce_hwmon_temp_from_raw(raw);
+		return 0;
+	case hwmon_temp_max:
+		raw = phy_read_mmd(phydev, MDIO_MMD_VEND2,
+				   RTL8261CE_VND2_THERMAL_SENSOR_CTRL);
+		if (raw < 0)
+			return raw;
+
+		/* RTL8261CE stores the downspeed threshold as degrees Celsius
+		 * starting at bit 7. This differs from the generic RTL822x
+		 * hwmon layout, which shifts the same register by bit 6.
+		 */
+		*val = (raw >> RTL8261CE_THERMAL_THRESHOLD_SHIFT) * 1000;
+		return 0;
+	default:
+		return -EINVAL;
+	}
+}
+
+static const struct hwmon_ops rtl8261ce_hwmon_ops = {
+	.visible = 0444,
+	.read = rtl8261ce_hwmon_read,
+};
+
+static const struct hwmon_channel_info * const rtl8261ce_hwmon_info[] = {
+	HWMON_CHANNEL_INFO(temp, HWMON_T_INPUT | HWMON_T_MAX),
+	NULL
+};
+
+static const struct hwmon_chip_info rtl8261ce_hwmon_chip_info = {
+	.ops = &rtl8261ce_hwmon_ops,
+	.info = rtl8261ce_hwmon_info,
+};
+
+static int rtl8261ce_hwmon_init(struct phy_device *phydev)
+{
+	struct device *dev = &phydev->mdio.dev;
+	struct device *hwdev;
+
+	/* Clear latched thermal status bits without making hwmon registration
+	 * depend on this write.
+	 */
+	phy_clear_bits_mmd(phydev, MDIO_MMD_VEND2, RTL8261CE_VND2_TSALRM,
+			   RTL8261CE_THERMAL_ALARM_MASK);
+
+	hwdev = devm_hwmon_device_register_with_info(dev, NULL, phydev,
+						     &rtl8261ce_hwmon_chip_info,
+						     NULL);
+	return PTR_ERR_OR_ZERO(hwdev);
+}
 
 /* Replay one recovered MDIO (Management Data Input/Output) script table. This
  * is used for both the large firmware patch stages and the short post-patch
@@ -764,7 +847,7 @@ static int rtl8261ce_probe(struct phy_device *phydev)
 
 	phydev->priv = priv;
 
-	return 0;
+	return rtl8261ce_hwmon_init(phydev);
 }
 
 /* Re-apply PHY-side runtime state after a port stop/start, resume, or repeated
