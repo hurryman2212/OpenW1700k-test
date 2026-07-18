@@ -1,4 +1,3 @@
-From 6c7c5eda3af220afc32da788caf8d7a4011b2db4 Mon Sep 17 00:00:00 2001
 From: Mieczyslaw Nalewaj <namiltd@yahoo.com>
 Date: Tue, 14 Apr 2026 08:47:00 +0200
 Subject: [PATCH] crypto: eip93 - select AES fallback threshold by key length
@@ -20,10 +19,10 @@ Signed-off-by: Jihong Min <hurryman2212@gmail.com>
  2 files changed, 4 insertions(+), 1 deletion(-)
 
 diff --git a/drivers/crypto/inside-secure/eip93/eip93-cipher.c b/drivers/crypto/inside-secure/eip93/eip93-cipher.c
-index 87c1e54..c3eade6 100644
+index 4a10d60..6a8f2e9 100644
 --- a/drivers/crypto/inside-secure/eip93/eip93-cipher.c
 +++ b/drivers/crypto/inside-secure/eip93/eip93-cipher.c
-@@ -134,6 +134,8 @@ static int eip93_skcipher_setkey(struct crypto_skcipher *ctfm, const u8 *key,
+@@ -141,6 +141,8 @@ static int eip93_skcipher_setkey(struct crypto_skcipher *ctfm, const u8 *key,
  			return ret;
  	}
  
@@ -32,7 +31,7 @@ index 87c1e54..c3eade6 100644
  	if (flags & EIP93_ALG_AES) {
  		struct crypto_aes_ctx aes;
  		bool fallback = eip93_skcipher_is_fallback(tfm, flags);
-@@ -182,7 +184,7 @@ static int eip93_skcipher_crypt(struct skcipher_request *req, bool encrypt)
+@@ -188,7 +190,7 @@ static int eip93_skcipher_crypt(struct skcipher_request *req, bool encrypt)
  			return -EINVAL;
  
  	if (fallback &&
@@ -42,11 +41,11 @@ index 87c1e54..c3eade6 100644
  			      CONFIG_CRYPTO_DEV_EIP93_GENERIC_SW_MAX_LEN)) {
  		skcipher_request_set_tfm(&rctx->fallback_req, ctx->fallback);
 diff --git a/drivers/crypto/inside-secure/eip93/eip93-cipher.h b/drivers/crypto/inside-secure/eip93/eip93-cipher.h
-index 9dac8af..ea91cdc 100644
+index 3203d65..f2e310a 100644
 --- a/drivers/crypto/inside-secure/eip93/eip93-cipher.h
 +++ b/drivers/crypto/inside-secure/eip93/eip93-cipher.h
-@@ -23,6 +23,7 @@ struct eip93_crypto_ctx {
- 	bool				set_assoc;
+@@ -21,6 +21,7 @@ struct eip93_crypto_ctx {
+ 	unsigned int			authsize;
  	enum eip93_alg_type		type;
  	struct crypto_skcipher		*fallback;
 +	u32				keylen;

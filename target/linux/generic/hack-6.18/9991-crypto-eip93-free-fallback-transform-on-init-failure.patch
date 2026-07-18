@@ -1,0 +1,33 @@
+From 15093901f8a927f07582b3da6009aef0eec427f4 Mon Sep 17 00:00:00 2001
+From: Jihong Min <hurryman2212@gmail.com>
+Date: Sun, 19 Jul 2026 04:18:08 +0900
+Subject: [PATCH] crypto: eip93: free the fallback transform on init failure
+
+The fallback transform is allocated before the hardware SA record.  Release
+it if the later SA allocation fails instead of leaking the transform from a
+failed cra_init() call.
+
+Assisted-by: Codex:gpt-5.6
+Signed-off-by: Jihong Min <hurryman2212@gmail.com>
+---
+ drivers/crypto/inside-secure/eip93/eip93-cipher.c | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/crypto/inside-secure/eip93/eip93-cipher.c b/drivers/crypto/inside-secure/eip93/eip93-cipher.c
+index 6a8f2e9..d9e848c 100644
+--- a/drivers/crypto/inside-secure/eip93/eip93-cipher.c
++++ b/drivers/crypto/inside-secure/eip93/eip93-cipher.c
+@@ -88,8 +88,10 @@ static int eip93_skcipher_cra_init(struct crypto_tfm *tfm)
+ 	ctx->type = tmpl->type;
+ 
+ 	ctx->sa_record = kzalloc(sizeof(*ctx->sa_record), GFP_KERNEL);
+-	if (!ctx->sa_record)
++	if (!ctx->sa_record) {
++		crypto_free_skcipher(ctx->fallback);
+ 		return -ENOMEM;
++	}
+ 
+ 	return 0;
+ }
+-- 
+2.53.0

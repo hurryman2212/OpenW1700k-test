@@ -1,4 +1,4 @@
-From 4b9bfc1c598a17746ae8c3635765073e4ad9812a Mon Sep 17 00:00:00 2001
+From 46d673033b7f6974d0bf5696ff8365fd412cd646 Mon Sep 17 00:00:00 2001
 From: Aviana Cruz <gwencroft@proton.me>
 Date: Mon, 20 Jun 2022 21:55:45 +0800
 Subject: [PATCH] crypto: eip93 - use AES fallback for small requests
@@ -37,7 +37,7 @@ index 8353d3d..81b9491 100644
 +	  Max length of crypt request which
 +	  will fallback to software crypt of AES-128 skcipher.
 diff --git a/drivers/crypto/inside-secure/eip93/eip93-cipher.c b/drivers/crypto/inside-secure/eip93/eip93-cipher.c
-index 57caa4b..87c1e54 100644
+index c0d41b9..4a10d60 100644
 --- a/drivers/crypto/inside-secure/eip93/eip93-cipher.c
 +++ b/drivers/crypto/inside-secure/eip93/eip93-cipher.c
 @@ -30,6 +30,13 @@ void eip93_skcipher_handle_result(struct crypto_async_request *async, int err)
@@ -54,7 +54,7 @@ index 57caa4b..87c1e54 100644
  static int eip93_skcipher_send_req(struct crypto_async_request *async)
  {
  	struct eip93_crypto_ctx *ctx = crypto_tfm_ctx(async->tfm);
-@@ -55,12 +62,21 @@ static int eip93_skcipher_cra_init(struct crypto_tfm *tfm)
+@@ -62,12 +69,21 @@ static int eip93_skcipher_cra_init(struct crypto_tfm *tfm)
  	struct eip93_crypto_ctx *ctx = crypto_tfm_ctx(tfm);
  	struct eip93_alg_template *tmpl = container_of(tfm->__crt_alg,
  				struct eip93_alg_template, alg.skcipher.base);
@@ -79,7 +79,7 @@ index 57caa4b..87c1e54 100644
  	ctx->eip93 = tmpl->eip93;
  	ctx->type = tmpl->type;
  
-@@ -76,6 +92,8 @@ static void eip93_skcipher_cra_exit(struct crypto_tfm *tfm)
+@@ -83,6 +99,8 @@ static void eip93_skcipher_cra_exit(struct crypto_tfm *tfm)
  	struct eip93_crypto_ctx *ctx = crypto_tfm_ctx(tfm);
  
  	kfree(ctx->sa_record);
@@ -88,7 +88,7 @@ index 57caa4b..87c1e54 100644
  }
  
  static int eip93_skcipher_setkey(struct crypto_skcipher *ctfm, const u8 *key,
-@@ -118,6 +136,14 @@ static int eip93_skcipher_setkey(struct crypto_skcipher *ctfm, const u8 *key,
+@@ -125,6 +143,14 @@ static int eip93_skcipher_setkey(struct crypto_skcipher *ctfm, const u8 *key,
  
  	if (flags & EIP93_ALG_AES) {
  		struct crypto_aes_ctx aes;
@@ -103,15 +103,15 @@ index 57caa4b..87c1e54 100644
  
  		ctx->blksize = AES_BLOCK_SIZE;
  		ret = aes_expandkey(&aes, key, keylen);
-@@ -140,6 +166,7 @@ static int eip93_skcipher_crypt(struct skcipher_request *req, bool encrypt)
+@@ -147,6 +173,7 @@ static int eip93_skcipher_crypt(struct skcipher_request *req, bool encrypt)
  	struct crypto_async_request *async = &req->base;
  	struct eip93_crypto_ctx *ctx = crypto_tfm_ctx(req->base.tfm);
  	struct crypto_skcipher *skcipher = crypto_skcipher_reqtfm(req);
 +	bool fallback = eip93_skcipher_is_fallback(req->base.tfm, rctx->flags);
- 	int ret;
  
  	if (!req->cryptlen)
-@@ -154,6 +181,21 @@ static int eip93_skcipher_crypt(struct skcipher_request *req, bool encrypt)
+ 		return 0;
+@@ -160,6 +187,21 @@ static int eip93_skcipher_crypt(struct skcipher_request *req, bool encrypt)
  				crypto_skcipher_blocksize(skcipher)))
  			return -EINVAL;
  
@@ -134,18 +134,18 @@ index 57caa4b..87c1e54 100644
  	if (encrypt)
  		rctx->sa_record.sa_cmd0_word &= ~EIP93_SA_CMD_DIRECTION_IN;
 diff --git a/drivers/crypto/inside-secure/eip93/eip93-cipher.h b/drivers/crypto/inside-secure/eip93/eip93-cipher.h
-index 72753cd..9dac8af 100644
+index 23ac533..3203d65 100644
 --- a/drivers/crypto/inside-secure/eip93/eip93-cipher.h
 +++ b/drivers/crypto/inside-secure/eip93/eip93-cipher.h
-@@ -22,6 +22,7 @@ struct eip93_crypto_ctx {
- 	unsigned int			assoclen;
- 	bool				set_assoc;
+@@ -20,6 +20,7 @@ struct eip93_crypto_ctx {
+ 	/* AEAD specific */
+ 	unsigned int			authsize;
  	enum eip93_alg_type		type;
 +	struct crypto_skcipher		*fallback;
  };
  
  struct eip93_cipher_reqctx {
-@@ -43,6 +44,7 @@ struct eip93_cipher_reqctx {
+@@ -42,6 +43,7 @@ struct eip93_cipher_reqctx {
  	int				dst_nents;
  	struct sa_state			*sa_state_ctr;
  	dma_addr_t			sa_state_ctr_base;
@@ -155,4 +155,3 @@ index 72753cd..9dac8af 100644
  int check_valid_request(struct eip93_cipher_reqctx *rctx);
 -- 
 2.53.0
-
