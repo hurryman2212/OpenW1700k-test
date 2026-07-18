@@ -1,0 +1,154 @@
+From 49dbe757261adbd5f8279a03ed9144696464b4a7 Mon Sep 17 00:00:00 2001
+From: Jihong Min <hurryman2212@gmail.com>
+Date: Sun, 19 Jul 2026 03:59:54 +0900
+Subject: [PATCH] crypto: eip93: track active hash DMA mappings
+
+DMA address zero is valid on some platforms, so it cannot be used as a
+sentinel for a successful mapping.  Track each active hash mapping
+explicitly and only unmap resources whose mapping completed.
+
+This also makes partially prepared block and HMAC requests safe to unwind
+when a later mapping fails.
+
+Fixes: 9739f5f93b78 ("crypto: eip93 - Add Inside Secure SafeXcel EIP-93 crypto engine support")
+Reported-by: Benjamin Larsson <benjamin.larsson@genexis.eu>
+Link: https://lore.kernel.org/linux-crypto/20260707171537.467608-2-hurryman2212@gmail.com/
+Suggested-by: Benjamin Larsson <benjamin.larsson@genexis.eu>
+Assisted-by: Codex:gpt-5.6
+Signed-off-by: Jihong Min <hurryman2212@gmail.com>
+---
+ .../crypto/inside-secure/eip93/eip93-hash.c   | 27 ++++++++++++++-----
+ .../crypto/inside-secure/eip93/eip93-hash.h   |  3 +++
+ 2 files changed, 23 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/crypto/inside-secure/eip93/eip93-hash.c b/drivers/crypto/inside-secure/eip93/eip93-hash.c
+index ac13d90..0c6f466 100644
+--- a/drivers/crypto/inside-secure/eip93/eip93-hash.c
++++ b/drivers/crypto/inside-secure/eip93/eip93-hash.c
+@@ -27,14 +27,15 @@ static void eip93_hash_free_data_blocks(struct ahash_request *req)
+ 	struct mkt_hash_block *block, *tmp;
+ 
+ 	list_for_each_entry_safe(block, tmp, &rctx->blocks, list) {
+-		dma_unmap_single(eip93->dev, block->data_dma,
+-				 SHA256_BLOCK_SIZE, DMA_TO_DEVICE);
++		if (block->data_mapped)
++			dma_unmap_single(eip93->dev, block->data_dma,
++					 SHA256_BLOCK_SIZE, DMA_TO_DEVICE);
+ 		kfree(block);
+ 	}
+ 	if (!list_empty(&rctx->blocks))
+ 		INIT_LIST_HEAD(&rctx->blocks);
+ 
+-	if (rctx->finalize)
++	if (rctx->data_mapped)
+ 		dma_unmap_single(eip93->dev, rctx->data_dma,
+ 				 rctx->data_used,
+ 				 DMA_TO_DEVICE);
+@@ -47,7 +48,7 @@ static void eip93_hash_free_sa_record(struct ahash_request *req)
+ 	struct eip93_hash_ctx *ctx = crypto_ahash_ctx(ahash);
+ 	struct eip93_device *eip93 = ctx->eip93;
+ 
+-	if (IS_HMAC(ctx->flags))
++	if (rctx->sa_record_hmac_mapped)
+ 		dma_unmap_single(eip93->dev, rctx->sa_record_hmac_base,
+ 				 sizeof(rctx->sa_record_hmac), DMA_TO_DEVICE);
+ 
+@@ -200,13 +201,16 @@ static void __eip93_hash_init(struct ahash_request *req)
+ 
+ 	rctx->len = 0;
+ 	rctx->data_used = 0;
++	rctx->sa_record_hmac_mapped = false;
++	rctx->data_mapped = false;
+ 	rctx->partial_hash = false;
+ 	rctx->finalize = false;
+ 	INIT_LIST_HEAD(&rctx->blocks);
+ }
+ 
+ static int eip93_send_hash_req(struct crypto_async_request *async, u8 *data,
+-			       dma_addr_t *data_dma, u32 len, bool last)
++			       dma_addr_t *data_dma, bool *data_mapped,
++			       u32 len, bool last)
+ {
+ 	struct ahash_request *req = ahash_request_cast(async);
+ 	struct eip93_hash_reqctx *rctx = ahash_request_ctx_dma(req);
+@@ -222,6 +226,8 @@ static int eip93_send_hash_req(struct crypto_async_request *async, u8 *data,
+ 	ret = dma_mapping_error(eip93->dev, src_addr);
+ 	if (ret)
+ 		return ret;
++	*data_dma = src_addr;
++	*data_mapped = true;
+ 
+ 	cdesc.pe_ctrl_stat_word = FIELD_PREP(EIP93_PE_CTRL_PE_READY_DES_TRING_OWN,
+ 					     EIP93_PE_CTRL_HOST_READY);
+@@ -251,9 +257,10 @@ static int eip93_send_hash_req(struct crypto_async_request *async, u8 *data,
+ 									   DMA_TO_DEVICE);
+ 				ret = dma_mapping_error(eip93->dev, rctx->sa_record_hmac_base);
+ 				if (ret)
+-					return ret;
++					goto unmap_src;
+ 
+ 				cdesc.sa_addr = rctx->sa_record_hmac_base;
++				rctx->sa_record_hmac_mapped = true;
+ 			}
+ 
+ 			cdesc.pe_ctrl_stat_word |= EIP93_PE_CTRL_PE_HASH_FINAL;
+@@ -279,8 +286,12 @@ again:
+ 	/* Writing new descriptor count starts DMA action */
+ 	writel(1, eip93->base + EIP93_REG_PE_CD_COUNT);
+ 
+-	*data_dma = src_addr;
+ 	return 0;
++
++unmap_src:
++	dma_unmap_single(eip93->dev, src_addr, len, DMA_TO_DEVICE);
++	*data_mapped = false;
++	return ret;
+ }
+ 
+ static int eip93_hash_init(struct ahash_request *req)
+@@ -373,6 +384,7 @@ static int __eip93_hash_update(struct ahash_request *req, bool complete_req)
+ 
+ 		ret = eip93_send_hash_req(async, block->data,
+ 					  &block->data_dma,
++					  &block->data_mapped,
+ 					  SHA256_BLOCK_SIZE, wait_req);
+ 		if (ret)
+ 			goto free_blocks;
+@@ -492,6 +504,7 @@ static int __eip93_hash_final(struct ahash_request *req, bool map_dma)
+ 
+ 	/* Send last block */
+ 	ret = eip93_send_hash_req(async, rctx->data, &rctx->data_dma,
++				  &rctx->data_mapped,
+ 				  rctx->data_used, true);
+ 	if (ret)
+ 		goto free_blocks;
+diff --git a/drivers/crypto/inside-secure/eip93/eip93-hash.h b/drivers/crypto/inside-secure/eip93/eip93-hash.h
+index 556f22f..8b75525 100644
+--- a/drivers/crypto/inside-secure/eip93/eip93-hash.h
++++ b/drivers/crypto/inside-secure/eip93/eip93-hash.h
+@@ -32,6 +32,7 @@ struct eip93_hash_reqctx {
+ 	dma_addr_t		sa_record_base;
+ 	dma_addr_t		sa_record_hmac_base;
+ 	dma_addr_t		sa_state_base;
++	bool			sa_record_hmac_mapped;
+ 
+ 	/* Don't enable HASH_FINALIZE when last block is sent */
+ 	bool			partial_hash;
+@@ -48,6 +49,7 @@ struct eip93_hash_reqctx {
+ 
+ 	u8			data[SHA256_BLOCK_SIZE] __aligned(sizeof(u32));
+ 	dma_addr_t		data_dma;
++	bool			data_mapped;
+ 
+ 	struct list_head	blocks;
+ };
+@@ -56,6 +58,7 @@ struct mkt_hash_block {
+ 	struct list_head	list;
+ 	u8			data[SHA256_BLOCK_SIZE] __aligned(sizeof(u32));
+ 	dma_addr_t		data_dma;
++	bool			data_mapped;
+ };
+ 
+ struct eip93_hash_export_state {
+-- 
+2.53.0
