@@ -1,0 +1,87 @@
+From: Jihong Min <hurryman2212@gmail.com>
+Date: Tue, 26 May 2026 04:54:11 +0900
+Subject: [PATCH] netfilter: flowtable: build immutable flow keys for path discovery
+
+ecb97eb4c3's standalone nft_flow_offload bridge series added a forward
+path walk in nft_dev_forward_path() that sniffed the live skb to derive
+the post-NAT tuple, and reused the same skb state for both directions.
+For the reverse direction this corrupts the address/port lookups used
+by bridging-aware path discovery, since by the time the second call
+runs the skb has been mangled or even freed back to the stack.
+
+Build immutable flow_keys from the post-NAT flowtable tuple for each
+direction and pass them via ctx.flow to dev_fill_forward_path_flow().
+This lets upper devices whose lower-device selection depends on the
+flow (and any future consumers of the flow-aware forward-path API
+added by the flow-aware discovery patch) compute the same path the
+transmit path will use, without touching the skb.
+
+Assisted-by: Codex:gpt-5.5
+Signed-off-by: Jihong Min <hurryman2212@gmail.com>
+---
+--- a/net/netfilter/nf_flow_table_path.c	2026-07-26 14:45:50.708225618 -1000
++++ b/net/netfilter/nf_flow_table_path.c	2026-07-26 14:49:56.202209143 -1000
+@@ -18,6 +18,7 @@
+ #include <linux/if_ether.h>
+ #include <net/route.h>
+ #include <net/ip6_route.h>
++#include <net/flow_dissector.h>
+ 
+ static enum flow_offload_xmit_type nft_xmit_type(struct dst_entry *dst)
+ {
+@@ -85,6 +86,41 @@
+ 	return __dev_fill_forward_path(ctx, ha, stack);
+ }
+ 
++static void nft_flow_keys_init(const struct nf_conn *ct,
++			       enum ip_conntrack_dir dir,
++			       struct flow_keys *flow)
++{
++	const struct nf_conntrack_tuple *tuple = &ct->tuplehash[dir].tuple;
++	const struct nf_conntrack_tuple *other = &ct->tuplehash[!dir].tuple;
++
++	memset(flow, 0, sizeof(*flow));
++
++	/* Match the packet tuple after flowtable NAT mangling. */
++	switch (tuple->src.l3num) {
++	case NFPROTO_IPV4:
++		flow->control.addr_type = FLOW_DISSECTOR_KEY_IPV4_ADDRS;
++		flow->basic.n_proto = htons(ETH_P_IP);
++		flow->addrs.v4addrs.src = other->dst.u3.ip;
++		flow->addrs.v4addrs.dst = other->src.u3.ip;
++		break;
++	case NFPROTO_IPV6:
++		flow->control.addr_type = FLOW_DISSECTOR_KEY_IPV6_ADDRS;
++		flow->basic.n_proto = htons(ETH_P_IPV6);
++		flow->addrs.v6addrs.src = other->dst.u3.in6;
++		flow->addrs.v6addrs.dst = other->src.u3.in6;
++		break;
++	}
++
++	flow->basic.ip_proto = tuple->dst.protonum;
++	switch (tuple->dst.protonum) {
++	case IPPROTO_TCP:
++	case IPPROTO_UDP:
++		flow->ports.src = other->dst.u.all;
++		flow->ports.dst = other->src.u.all;
++		break;
++	}
++}
++
+ struct nft_forward_info {
+ 	const struct net_device *indev;
+ 	const struct net_device *outdev;
+@@ -217,10 +253,13 @@
+ 		.dev	= dst->dev,
+ 	};
+ 	struct nft_forward_info info = {};
++	struct flow_keys flow;
+ 	unsigned char ha[ETH_ALEN];
+ 	int i;
+ 
+ 	memset(ha, 0, sizeof(ha));
++	nft_flow_keys_init(ct, dir, &flow);
++	ctx.flow = &flow;
+ 
+ 	if (is_bridging) {
+ 		enum ip_conntrack_info pkt_ctinfo;
