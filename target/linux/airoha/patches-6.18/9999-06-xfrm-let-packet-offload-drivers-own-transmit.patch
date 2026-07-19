@@ -1,0 +1,227 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jihong Min <hurryman2212@gmail.com>
+Date: Tue, 4 Aug 2026 16:29:39 +0900
+Subject: [PATCH] xfrm: let packet offload drivers own transmit
+
+Delegate packet transmission to drivers that provide packet XFRM offload.
+
+Assisted-by: Codex:gpt-5.6
+Signed-off-by: Jihong Min <hurryman2212@gmail.com>
+---
+ net/xfrm/xfrm_output.c | 149 +++++++++++++++++++++++++++++------------
+ 1 file changed, 108 insertions(+), 41 deletions(-)
+
+diff --git a/net/xfrm/xfrm_output.c b/net/xfrm/xfrm_output.c
+index 54222fc..332b934 100644
+--- a/net/xfrm/xfrm_output.c
++++ b/net/xfrm/xfrm_output.c
+@@ -489,13 +489,57 @@ int pktgen_xfrm_outer_mode_output(struct xfrm_state *x, struct sk_buff *skb)
+ EXPORT_SYMBOL_GPL(pktgen_xfrm_outer_mode_output);
+ #endif
+ 
++int xfrm_dev_packet_state_check(struct xfrm_state *x, struct sk_buff *skb)
++{
++	struct net *net = xs_net(x);
++	int err;
++
++	spin_lock_bh(&x->lock);
++	if (unlikely(x->km.state != XFRM_STATE_VALID)) {
++		XFRM_INC_STATS(net, LINUX_MIB_XFRMOUTSTATEINVALID);
++		err = -EINVAL;
++		goto unlock;
++	}
++
++	err = xfrm_state_check_expire(x);
++	if (err) {
++		XFRM_INC_STATS(net, LINUX_MIB_XFRMOUTSTATEEXPIRED);
++		goto unlock;
++	}
++
++	err = xfrm_replay_overflow(x, skb);
++	if (err) {
++		XFRM_INC_STATS(net, LINUX_MIB_XFRMOUTSTATESEQERROR);
++		goto unlock;
++	}
++
++	x->curlft.bytes += skb->len;
++	x->curlft.packets++;
++	x->lastused = ktime_get_real_seconds();
++	err = 0;
++
++unlock:
++	spin_unlock_bh(&x->lock);
++
++	return err;
++}
++EXPORT_SYMBOL_GPL(xfrm_dev_packet_state_check);
++
+ static int xfrm_output_one(struct sk_buff *skb, int err)
+ {
+ 	struct dst_entry *dst = skb_dst(skb);
+ 	struct xfrm_state *x = dst->xfrm;
+ 	struct net *net = xs_net(x);
++	bool packet_offload;
+ 
+-	if (err <= 0 || x->xso.type == XFRM_DEV_OFFLOAD_PACKET)
++	if (err <= 0)
++		goto resume;
++
++	spin_lock_bh(&x->lock);
++	packet_offload = x->km.state == XFRM_STATE_VALID &&
++			 x->xso.type == XFRM_DEV_OFFLOAD_PACKET;
++	spin_unlock_bh(&x->lock);
++	if (packet_offload)
+ 		goto resume;
+ 
+ 	do {
+@@ -513,31 +557,9 @@ static int xfrm_output_one(struct sk_buff *skb, int err)
+ 			goto error_nolock;
+ 		}
+ 
+-		spin_lock_bh(&x->lock);
+-
+-		if (unlikely(x->km.state != XFRM_STATE_VALID)) {
+-			XFRM_INC_STATS(net, LINUX_MIB_XFRMOUTSTATEINVALID);
+-			err = -EINVAL;
+-			goto error;
+-		}
+-
+-		err = xfrm_state_check_expire(x);
+-		if (err) {
+-			XFRM_INC_STATS(net, LINUX_MIB_XFRMOUTSTATEEXPIRED);
+-			goto error;
+-		}
+-
+-		err = xfrm_replay_overflow(x, skb);
+-		if (err) {
+-			XFRM_INC_STATS(net, LINUX_MIB_XFRMOUTSTATESEQERROR);
+-			goto error;
+-		}
+-
+-		x->curlft.bytes += skb->len;
+-		x->curlft.packets++;
+-		x->lastused = ktime_get_real_seconds();
+-
+-		spin_unlock_bh(&x->lock);
++		err = xfrm_dev_packet_state_check(x, skb);
++		if (err)
++			goto error_nolock;
+ 
+ 		skb_dst_force(skb);
+ 		if (!skb_dst(skb)) {
+@@ -575,8 +597,6 @@ static int xfrm_output_one(struct sk_buff *skb, int err)
+ 
+ 	return 0;
+ 
+-error:
+-	spin_unlock_bh(&x->lock);
+ error_nolock:
+ 	kfree_skb(skb);
+ out:
+@@ -744,11 +764,17 @@ int xfrm_output(struct sock *sk, struct sk_buff *skb)
+ {
+ 	struct net *net = dev_net(skb_dst(skb)->dev);
+ 	struct xfrm_state *x = skb_dst(skb)->xfrm;
++	u8 offload_type = XFRM_DEV_OFFLOAD_UNSPECIFIED;
+ 	int family;
+ 	int err;
+ 
+-	family = (x->xso.type != XFRM_DEV_OFFLOAD_PACKET) ? x->outer_mode.family
+-		: skb_dst(skb)->ops->family;
++	spin_lock_bh(&x->lock);
++	if (x->km.state == XFRM_STATE_VALID)
++		offload_type = x->xso.type;
++	spin_unlock_bh(&x->lock);
++
++	family = offload_type != XFRM_DEV_OFFLOAD_PACKET ? x->outer_mode.family :
++							 skb_dst(skb)->ops->family;
+ 
+ 	switch (family) {
+ 	case AF_INET:
+@@ -762,25 +788,58 @@ int xfrm_output(struct sock *sk, struct sk_buff *skb)
+ 		break;
+ 	}
+ 
+-	if (x->xso.type == XFRM_DEV_OFFLOAD_PACKET) {
++	if (offload_type == XFRM_DEV_OFFLOAD_PACKET) {
++#ifdef CONFIG_XFRM_OFFLOAD
++		const struct xfrmdev_ops *ops;
++		struct net_device *dev;
++#endif
++
+ 		if (!xfrm_dev_offload_ok(skb, x)) {
+ 			XFRM_INC_STATS(net, LINUX_MIB_XFRMOUTERROR);
+ 			kfree_skb(skb);
+ 			return -EHOSTUNREACH;
+ 		}
+ 
+-		/* Exclusive direct xmit for tunnel mode, as
+-		 * some filtering or matching rules may apply
+-		 * in transport mode.
+-		 * Locally generated packets also require
+-		 * the normal XFRM path for L2 header setup,
+-		 * as the hardware needs the L2 header to match
+-		 * for encryption, so skip direct output as well.
+-		 */
++#ifdef CONFIG_XFRM_OFFLOAD
++		if (unlikely(!xfrm_dev_offload_get(x)))
++			goto state_invalid;
++
++		dev = READ_ONCE(x->xso.dev);
++		ops = READ_ONCE(dev->xfrmdev_ops);
++		if (unlikely(!ops || ops != READ_ONCE(x->xso.state_ops))) {
++			xfrm_dev_offload_put(x);
++			goto state_invalid;
++		}
++
++		if (ops->xdo_dev_packet_xmit) {
++			skb->mark = xfrm_smark_get(skb->mark, x);
++			err = ops->xdo_dev_packet_xmit(sk, skb, x);
++		} else {
++			/* Exclusive direct xmit for tunnel mode, as some
++			 * filtering or matching rules may apply in transport
++			 * mode. Locally generated packets also require the normal
++			 * XFRM path for L2 header setup, as the hardware needs the
++			 * L2 header to match for encryption.
++			 */
++			if (x->props.mode == XFRM_MODE_TUNNEL && !skb->sk)
++				err = xfrm_dev_direct_output(sk, x, skb);
++			else
++				err = xfrm_output_resume(sk, skb, 0);
++		}
++		xfrm_dev_offload_put(x);
++
++		return err;
++
++state_invalid:
++		XFRM_INC_STATS(net, LINUX_MIB_XFRMOUTSTATEINVALID);
++		kfree_skb(skb);
++		return -EINVAL;
++#else
+ 		if (x->props.mode == XFRM_MODE_TUNNEL && !skb->sk)
+ 			return xfrm_dev_direct_output(sk, x, skb);
+ 
+ 		return xfrm_output_resume(sk, skb, 0);
++#endif
+ 	}
+ 
+ 	secpath_reset(skb);
+@@ -810,8 +869,16 @@ int xfrm_output(struct sock *sk, struct sk_buff *skb)
+ 			goto out;
+ 		}
+ 
+-		if (x->xso.dev && x->xso.dev->features & NETIF_F_HW_ESP_TX_CSUM)
+-			goto out;
++		if (xfrm_dev_offload_get(x)) {
++			struct net_device *dev = READ_ONCE(x->xso.dev);
++			bool esp_tx_csum;
++
++			esp_tx_csum = READ_ONCE(dev->features) &
++				      NETIF_F_HW_ESP_TX_CSUM;
++			xfrm_dev_offload_put(x);
++			if (esp_tx_csum)
++				goto out;
++		}
+ 	} else {
+ 		if (skb_is_gso(skb))
+ 			return xfrm_output_gso(net, sk, skb);

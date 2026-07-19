@@ -1,0 +1,47 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jihong Min <hurryman2212@gmail.com>
+Date: Tue, 4 Aug 2026 16:29:39 +0900
+Subject: [PATCH] netfilter: flowtable: carry XFRM route metadata
+
+Carry XFRM input state and policy generation metadata in flow routes.
+
+Assisted-by: Codex:gpt-5.6
+Signed-off-by: Jihong Min <hurryman2212@gmail.com>
+---
+ include/net/netfilter/nf_flow_table.h | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/include/net/netfilter/nf_flow_table.h b/include/net/netfilter/nf_flow_table.h
+index 420bcfe..627fd2d 100644
+--- a/include/net/netfilter/nf_flow_table.h
++++ b/include/net/netfilter/nf_flow_table.h
+@@ -16,6 +16,7 @@
+ struct nf_flowtable;
+ struct nf_flow_rule;
+ struct flow_offload;
++struct xfrm_state;
+ enum flow_offload_tuple_dir;
+ 
+ struct nf_flow_key {
+@@ -150,6 +151,10 @@ struct flow_offload_tuple {
+ 					in_vlan_ingress:2;
+ 	u16				mtu;
+ 	u8				dscp;
++	struct xfrm_state		*xfrm_input;
++	u32				xfrm_input_flow_id;
++	u32				xfrm_policy_genid;
++	bool				xfrm_input_deferred;
+ 	union {
+ 		struct {
+ 			struct dst_entry *dst_cache;
+@@ -213,6 +218,10 @@ static inline __s32 nf_flow_timeout_delta(unsigned int timeout)
+ struct nf_flow_route {
+ 	struct {
+ 		struct dst_entry		*dst;
++		struct xfrm_state		*xfrm_input;
++		u32				xfrm_input_flow_id;
++		u32				xfrm_policy_genid;
++		bool				xfrm_input_deferred;
+ 		struct {
+ 			u32			ifindex;
+ 			struct {

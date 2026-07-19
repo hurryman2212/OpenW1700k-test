@@ -1,0 +1,72 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jihong Min <hurryman2212@gmail.com>
+Date: Tue, 4 Aug 2026 16:29:39 +0900
+Subject: [PATCH] xfrm: validate packet offload input state
+
+Validate authenticated packet-offload metadata on the XFRM input path.
+
+Assisted-by: Codex:gpt-5.6
+Signed-off-by: Jihong Min <hurryman2212@gmail.com>
+---
+ net/xfrm/xfrm_input.c | 41 +++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 41 insertions(+)
+
+diff --git a/net/xfrm/xfrm_input.c b/net/xfrm/xfrm_input.c
+index cfee63a..3ac250e 100644
+--- a/net/xfrm/xfrm_input.c
++++ b/net/xfrm/xfrm_input.c
+@@ -133,6 +133,9 @@ struct sec_path *secpath_set(struct sk_buff *skb)
+ 	sp->olen = 0;
+ 	sp->len = 0;
+ 	sp->verified_cnt = 0;
++	sp->policy_checked = 0;
++	sp->policy_flowtable = 0;
++	sp->policy_genid = 0;
+ 
+ 	return sp;
+ }
+@@ -379,6 +382,44 @@ static int xfrm_prepare_input(struct xfrm_state *x, struct sk_buff *skb)
+ 	return xfrm_inner_mode_encap_remove(x, skb);
+ }
+ 
++int xfrm_dev_packet_input_state_check(struct xfrm_state *x, struct sk_buff *skb,
++				      __be32 seq)
++{
++	struct net *net = xs_net(x);
++	int err;
++
++	spin_lock_bh(&x->lock);
++	if (unlikely(x->km.state != XFRM_STATE_VALID)) {
++		XFRM_INC_STATS(net, LINUX_MIB_XFRMINSTATEINVALID);
++		err = -EINVAL;
++		goto unlock;
++	}
++
++	err = xfrm_replay_check(x, skb, seq);
++	if (err) {
++		XFRM_INC_STATS(net, LINUX_MIB_XFRMINSTATESEQERROR);
++		goto unlock;
++	}
++
++	err = xfrm_state_check_expire(x);
++	if (err) {
++		XFRM_INC_STATS(net, LINUX_MIB_XFRMINSTATEEXPIRED);
++		goto unlock;
++	}
++
++	xfrm_replay_advance(x, seq);
++	x->curlft.bytes += skb->len;
++	x->curlft.packets++;
++	x->lastused = ktime_get_real_seconds();
++	err = 0;
++
++unlock:
++	spin_unlock_bh(&x->lock);
++
++	return err;
++}
++EXPORT_SYMBOL_GPL(xfrm_dev_packet_input_state_check);
++
+ /* Remove encapsulation header.
+  *
+  * The IP header will be moved over the top of the encapsulation header.

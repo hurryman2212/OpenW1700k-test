@@ -1,0 +1,84 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jihong Min <hurryman2212@gmail.com>
+Date: Tue, 4 Aug 2026 16:29:39 +0900
+Subject: [PATCH] netfilter: flowtable: retain XFRM input state in flows
+
+Retain and release authenticated XFRM input state with flowtable entries.
+
+Assisted-by: Codex:gpt-5.6
+Signed-off-by: Jihong Min <hurryman2212@gmail.com>
+---
+ net/netfilter/nf_flow_table_core.c | 32 ++++++++++++++++++++++++++++++
+ 1 file changed, 32 insertions(+)
+
+diff --git a/net/netfilter/nf_flow_table_core.c b/net/netfilter/nf_flow_table_core.c
+index 2bb0339..624867b 100644
+--- a/net/netfilter/nf_flow_table_core.c
++++ b/net/netfilter/nf_flow_table_core.c
+@@ -17,6 +17,7 @@
+ #if IS_ENABLED(CONFIG_NET_SWITCHDEV)
+ #include <net/switchdev.h>
+ #endif
++#include <net/xfrm.h>
+ 
+ static DEFINE_MUTEX(flowtable_lock);
+ static LIST_HEAD(flowtables);
+@@ -115,6 +116,17 @@ static struct dst_entry *nft_route_dst_fetch(struct nf_flow_route *route,
+ 	return dst;
+ }
+ 
++static struct xfrm_state *
++nft_route_xfrm_fetch(struct nf_flow_route *route,
++		     enum flow_offload_tuple_dir dir)
++{
++	struct xfrm_state *x = route->tuple[dir].xfrm_input;
++
++	route->tuple[dir].xfrm_input = NULL;
++
++	return x;
++}
++
+ static int flow_offload_fill_route(struct flow_offload *flow,
+ 				   struct nf_flow_route *route,
+ 				   enum flow_offload_tuple_dir dir)
+@@ -141,6 +153,12 @@ static int flow_offload_fill_route(struct flow_offload *flow,
+ 		j++;
+ 	}
+ 	flow_tuple->encap_num = route->tuple[dir].in.num_encaps;
++	flow_tuple->xfrm_input = nft_route_xfrm_fetch(route, dir);
++	flow_tuple->xfrm_input_flow_id =
++		route->tuple[dir].xfrm_input_flow_id;
++	flow_tuple->xfrm_policy_genid = route->tuple[dir].xfrm_policy_genid;
++	flow_tuple->xfrm_input_deferred =
++		route->tuple[dir].xfrm_input_deferred;
+ 
+ 	switch (route->tuple[dir].xmit_type) {
+ 	case FLOW_OFFLOAD_XMIT_DIRECT:
+@@ -174,6 +192,18 @@ static void nft_flow_dst_release(struct flow_offload *flow,
+ 		dst_release(flow->tuplehash[dir].tuple.dst_cache);
+ }
+ 
++static void
++nft_flow_xfrm_release(struct flow_offload *flow,
++		      enum flow_offload_tuple_dir dir)
++{
++#if IS_ENABLED(CONFIG_XFRM)
++	struct xfrm_state *x = flow->tuplehash[dir].tuple.xfrm_input;
++
++	if (x)
++		xfrm_state_put(x);
++#endif
++}
++
+ void flow_offload_route_init(struct flow_offload *flow,
+ 			     struct nf_flow_route *route)
+ {
+@@ -269,6 +299,8 @@ static void flow_offload_route_release(struct flow_offload *flow)
+ {
+ 	nft_flow_dst_release(flow, FLOW_OFFLOAD_DIR_ORIGINAL);
+ 	nft_flow_dst_release(flow, FLOW_OFFLOAD_DIR_REPLY);
++	nft_flow_xfrm_release(flow, FLOW_OFFLOAD_DIR_ORIGINAL);
++	nft_flow_xfrm_release(flow, FLOW_OFFLOAD_DIR_REPLY);
+ }
+ 
+ void flow_offload_free(struct flow_offload *flow)

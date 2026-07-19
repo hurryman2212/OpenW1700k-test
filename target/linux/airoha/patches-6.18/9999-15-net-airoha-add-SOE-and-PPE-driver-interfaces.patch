@@ -1,0 +1,290 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jihong Min <hurryman2212@gmail.com>
+Date: Tue, 4 Aug 2026 16:29:39 +0900
+Subject: [PATCH] net: airoha: add SOE and PPE driver interfaces
+
+Define the SOE provider interface and its PPE flow ownership contracts.
+
+Assisted-by: Codex:gpt-5.6
+Signed-off-by: Jihong Min <hurryman2212@gmail.com>
+---
+ drivers/net/ethernet/airoha/airoha_soe.h | 270 +++++++++++++++++++++++
+ 1 file changed, 270 insertions(+)
+ create mode 100644 drivers/net/ethernet/airoha/airoha_soe.h
+
+diff --git a/drivers/net/ethernet/airoha/airoha_soe.h b/drivers/net/ethernet/airoha/airoha_soe.h
+new file mode 100644
+index 0000000..56d6cc5
+--- /dev/null
++++ b/drivers/net/ethernet/airoha/airoha_soe.h
+@@ -0,0 +1,270 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * Ethernet-facing declarations for the Airoha Secure Offload Engine (SOE)
++ * packet offload provider.
++ *
++ * airoha_eth owns SOE lifetime and calls these helpers to expose xfrm
++ * ESP/NAT-T offload on its netdevs. When CONFIG_NET_AIROHA_SOE is disabled,
++ * the stubs keep the Ethernet driver buildable without SOE support.
++ *
++ * Copyright (c) 2026 AIROHA Inc
++ * Author: Jihong Min <hurryman2212@gmail.com>
++ */
++
++#ifndef AIROHA_SOE_H
++#define AIROHA_SOE_H
++
++#include <linux/bitops.h>
++#include <linux/errno.h>
++#include <linux/kconfig.h>
++#include <linux/list.h>
++#include <linux/netdev_features.h>
++#include <linux/types.h>
++
++struct airoha_soe;
++struct airoha_soe_sa;
++struct airoha_eth;
++struct airoha_gdm_dev;
++struct device;
++struct net_device;
++struct netlink_ext_ack;
++struct sk_buff;
++struct sock;
++struct xfrm_state;
++
++#define AIROHA_SOE_FEATURE_ESP		BIT(0)
++#define AIROHA_SOE_QDMA_TX_RING		2
++
++typedef int (*airoha_soe_xmit_skb_t)(struct airoha_gdm_dev *dev,
++				     struct sk_buff *skb, u32 msg0, u32 msg1,
++				     u32 msg2);
++
++struct airoha_soe_ppe_flow_key {
++	__be32 saddr;
++	__be32 daddr;
++	__be16 sport;
++	__be16 dport;
++	u8 l4proto;
++};
++
++struct airoha_soe_ppe_flow {
++	struct list_head sa_node;
++	struct list_head soe_node;
++	struct airoha_soe *soe;
++	struct airoha_soe_sa *sa;
++	struct airoha_soe_ppe_flow_key key;
++	u64 bind_generation;
++	bool key_valid;
++	bool input;
++	bool bind_preparing;
++	bool bound;
++};
++
++struct airoha_soe_ppe_info {
++	__be32 saddr;
++	__be32 daddr;
++	__be32 spi;
++	__be16 sport;
++	__be16 dport;
++	u8 sa_index;
++	u8 hop;
++	bool encap;
++};
++
++#if IS_ENABLED(CONFIG_NET_AIROHA_SOE)
++bool airoha_soe_present(struct airoha_eth *eth);
++int airoha_soe_init(struct airoha_eth *eth);
++void airoha_soe_deinit(struct airoha_eth *eth);
++bool airoha_soe_available(struct airoha_soe *soe);
++u32 airoha_soe_features(struct airoha_soe *soe);
++void airoha_soe_build_netdev(struct net_device *dev,
++			     airoha_soe_xmit_skb_t xmit_skb);
++void airoha_soe_teardown_netdev(struct net_device *dev);
++int airoha_soe_set_features(struct net_device *dev, netdev_features_t features);
++bool airoha_soe_rx_is_completion(const void *data, size_t len, u32 msg0);
++bool airoha_soe_rx_skb(struct airoha_soe *soe, struct sk_buff *skb,
++		       unsigned int completion_tag, u32 hop_flags);
++bool airoha_soe_rx_drop(struct airoha_soe *soe,
++			unsigned int completion_tag);
++bool airoha_soe_rx_plain_skb(struct airoha_gdm_dev *dev, struct sk_buff *skb,
++			     struct net_device *rx_dev, u16 foe_hash,
++			     bool foe_valid, bool foe_unbound);
++bool airoha_soe_has_pending_ctx(struct airoha_soe *soe);
++int airoha_soe_xmit(struct airoha_soe_sa *sa, struct airoha_gdm_dev *dev,
++		    struct sock *sk, struct sk_buff *skb, struct xfrm_state *x);
++int airoha_soe_ppe_flow_add(struct airoha_soe *soe, struct xfrm_state *x,
++			    u8 dir, struct airoha_soe_ppe_flow *flow,
++			    struct airoha_soe_ppe_info *info);
++void airoha_soe_ppe_flow_del(struct airoha_soe_ppe_flow *flow);
++bool airoha_soe_ppe_flow_bind_start(struct airoha_soe_ppe_flow *flow,
++				    bool *ready);
++bool airoha_soe_ppe_flow_bind_ready(struct airoha_soe_ppe_flow *flow);
++bool airoha_soe_ppe_flow_bind_finish(struct airoha_soe_ppe_flow *flow);
++bool airoha_soe_ppe_flow_bind_share(struct airoha_soe_ppe_flow *flow,
++				    const struct airoha_soe_ppe_flow *source);
++bool airoha_soe_ppe_flow_bind_clone(struct airoha_soe_ppe_flow *flow,
++				    const struct airoha_soe_ppe_flow *source);
++void airoha_soe_ppe_flow_bind_abort(struct airoha_soe_ppe_flow *flow);
++void airoha_soe_ppe_flow_unbind(struct airoha_soe_ppe_flow *flow);
++void airoha_soe_ppe_flow_restore(struct airoha_soe_ppe_flow *flow);
++void airoha_soe_ppe_adopt_quiesce(struct airoha_soe *soe, bool quiesced);
++struct airoha_soe_ppe_flow *
++airoha_soe_ppe_flow_pop_sa(struct airoha_soe_sa *sa);
++struct airoha_soe_ppe_flow *
++airoha_soe_ppe_flow_pop_all(struct airoha_soe *soe);
++#else
++static inline bool airoha_soe_present(struct airoha_eth *eth)
++{
++	return false;
++}
++
++static inline int airoha_soe_init(struct airoha_eth *eth)
++{
++	return 0;
++}
++
++static inline void airoha_soe_deinit(struct airoha_eth *eth)
++{
++}
++
++static inline bool airoha_soe_available(struct airoha_soe *soe)
++{
++	return false;
++}
++
++static inline u32 airoha_soe_features(struct airoha_soe *soe)
++{
++	return 0;
++}
++
++static inline void airoha_soe_build_netdev(struct net_device *dev,
++					   airoha_soe_xmit_skb_t xmit_skb)
++{
++}
++
++static inline void airoha_soe_teardown_netdev(struct net_device *dev)
++{
++}
++
++static inline int airoha_soe_set_features(struct net_device *dev,
++					  netdev_features_t features)
++{
++	return 0;
++}
++
++static inline bool airoha_soe_rx_is_completion(const void *data, size_t len,
++					       u32 msg0)
++{
++	return false;
++}
++
++static inline bool airoha_soe_rx_skb(struct airoha_soe *soe,
++				     struct sk_buff *skb,
++				     unsigned int completion_tag, u32 hop_flags)
++{
++	return false;
++}
++
++static inline bool airoha_soe_rx_drop(struct airoha_soe *soe,
++				      unsigned int completion_tag)
++{
++	return false;
++}
++
++static inline bool airoha_soe_rx_plain_skb(struct airoha_gdm_dev *dev,
++					   struct sk_buff *skb,
++					   struct net_device *rx_dev,
++					   u16 foe_hash, bool foe_valid,
++					   bool foe_unbound)
++{
++	return false;
++}
++
++static inline bool airoha_soe_has_pending_ctx(struct airoha_soe *soe)
++{
++	return false;
++}
++
++static inline int airoha_soe_xmit(struct airoha_soe_sa *sa,
++				  struct airoha_gdm_dev *dev, struct sock *sk,
++				  struct sk_buff *skb, struct xfrm_state *x)
++{
++	return -EOPNOTSUPP;
++}
++
++static inline int
++airoha_soe_ppe_flow_add(struct airoha_soe *soe, struct xfrm_state *x, u8 dir,
++			struct airoha_soe_ppe_flow *flow,
++			struct airoha_soe_ppe_info *info)
++{
++	return -EOPNOTSUPP;
++}
++
++static inline void airoha_soe_ppe_flow_del(struct airoha_soe_ppe_flow *flow)
++{
++}
++
++static inline bool
++airoha_soe_ppe_flow_bind_start(struct airoha_soe_ppe_flow *flow, bool *ready)
++{
++	return false;
++}
++
++static inline bool
++airoha_soe_ppe_flow_bind_ready(struct airoha_soe_ppe_flow *flow)
++{
++	return false;
++}
++
++static inline bool
++airoha_soe_ppe_flow_bind_finish(struct airoha_soe_ppe_flow *flow)
++{
++	return false;
++}
++
++static inline bool
++airoha_soe_ppe_flow_bind_share(struct airoha_soe_ppe_flow *flow,
++			       const struct airoha_soe_ppe_flow *source)
++{
++	return false;
++}
++
++static inline bool
++airoha_soe_ppe_flow_bind_clone(struct airoha_soe_ppe_flow *flow,
++			       const struct airoha_soe_ppe_flow *source)
++{
++	return false;
++}
++
++static inline void
++airoha_soe_ppe_flow_bind_abort(struct airoha_soe_ppe_flow *flow)
++{
++}
++
++static inline void airoha_soe_ppe_flow_unbind(struct airoha_soe_ppe_flow *flow)
++{
++}
++
++static inline void airoha_soe_ppe_flow_restore(struct airoha_soe_ppe_flow *flow)
++{
++}
++
++static inline void
++airoha_soe_ppe_adopt_quiesce(struct airoha_soe *soe, bool quiesced)
++{
++}
++
++static inline struct airoha_soe_ppe_flow *
++airoha_soe_ppe_flow_pop_sa(struct airoha_soe_sa *sa)
++{
++	return NULL;
++}
++
++static inline struct airoha_soe_ppe_flow *
++airoha_soe_ppe_flow_pop_all(struct airoha_soe *soe)
++{
++	return NULL;
++}
++#endif
++
++#endif /* AIROHA_SOE_H */

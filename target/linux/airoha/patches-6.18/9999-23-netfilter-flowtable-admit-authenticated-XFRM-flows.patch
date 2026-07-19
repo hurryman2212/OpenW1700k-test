@@ -1,0 +1,124 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jihong Min <hurryman2212@gmail.com>
+Date: Tue, 4 Aug 2026 16:29:39 +0900
+Subject: [PATCH] netfilter: flowtable: admit authenticated XFRM flows
+
+Admit policy-verified packet-offload traffic while rejecting unsafe transforms.
+
+Assisted-by: Codex:gpt-5.6
+Signed-off-by: Jihong Min <hurryman2212@gmail.com>
+---
+ net/netfilter/nft_flow_offload.c | 57 +++++++++++++++++++++++++++++---
+ 1 file changed, 52 insertions(+), 5 deletions(-)
+
+diff --git a/net/netfilter/nft_flow_offload.c b/net/netfilter/nft_flow_offload.c
+index 6e95e31..417372e 100644
+--- a/net/netfilter/nft_flow_offload.c
++++ b/net/netfilter/nft_flow_offload.c
+@@ -17,6 +17,7 @@
+ #include <net/netfilter/nf_conntrack_core.h>
+ #include <net/netfilter/nf_conntrack_extend.h>
+ #include <net/netfilter/nf_flow_table.h>
++#include <net/xfrm.h>
+ 
+ struct nft_flow_offload {
+ 	struct nft_flowtable	*flowtable;
+@@ -44,8 +44,29 @@ static void nft_flow_set_dscp(const struct nft_pktinfo *pkt,
+ 
+ static bool nft_flow_offload_skip(struct sk_buff *skb, int family)
+ {
+-	if (skb_sec_path(skb))
+-		return true;
++#if IS_ENABLED(CONFIG_XFRM)
++	struct sec_path *sp = skb_sec_path(skb);
++
++	if (sp) {
++		struct xfrm_offload *xo = xfrm_input_offload(skb);
++		struct xfrm_state *x;
++
++		/* An autonomous PPE path has no skb mark to feed policy routing or
++		 * later policy checks, so only unmarked decrypted traffic is safe.
++		 */
++		if (skb->mark || sp->len != 1 ||
++		    sp->verified_cnt != sp->len ||
++		    !sp->policy_checked || !sp->policy_flowtable || !xo ||
++		    !(xo->flags & XFRM_HW_FLOW_ID))
++			return true;
++
++		x = sp->xvec[0];
++		if (sp->policy_genid != xfrm_policy_generation(xs_net(x)) ||
++		    x->xso.type != XFRM_DEV_OFFLOAD_PACKET ||
++		    x->xso.dir != XFRM_DEV_OFFLOAD_IN || !x->xso.dev)
++			return true;
++	}
++#endif
+ 
+ 	if (family == NFPROTO_IPV4) {
+ 		const struct ip_options *opt;
+@@ -78,6 +99,7 @@ static void nft_flow_offload_eval(const struct nft_expr *expr,
+ 	struct nf_flow_route route = {};
+ 	enum ip_conntrack_info ctinfo;
+ 	struct flow_offload *flow;
++	bool tcp_not_established = false;
+ 	enum ip_conntrack_dir dir;
+ 	struct nf_conn *ct;
+ 	int ret;
+@@ -93,9 +115,14 @@ static void nft_flow_offload_eval(const struct nft_expr *expr,
+ 	case IPPROTO_TCP:
+ 		tcph = skb_header_pointer(pkt->skb, nft_thoff(pkt),
+ 					  sizeof(_tcph), &_tcph);
+-		if (unlikely(!tcph || tcph->fin || tcph->rst ||
+-			     !nf_conntrack_tcp_established(ct)))
++		if (unlikely(!tcph))
++			goto out;
++		if (unlikely(tcph->fin || tcph->rst))
+ 			goto out;
++		if (unlikely(!nf_conntrack_tcp_established(ct))) {
++			tcp_not_established = true;
++			break;
++		}
+ 		break;
+ 	case IPPROTO_UDP:
+ 		break;
+@@ -147,6 +174,17 @@ static void nft_flow_offload_eval(const struct nft_expr *expr,
+ 			goto err_flow_route;
+ 	}
+ 
++	/* XFRM packet offload can hide part of the plaintext TCP handshake from
++	 * conntrack. Only an authenticated or explicitly deferred XFRM input
++	 * path may relax the normal established-only requirement.
++	 */
++	if (tcp_not_established &&
++	    !route.tuple[IP_CT_DIR_ORIGINAL].xfrm_input &&
++	    !route.tuple[IP_CT_DIR_REPLY].xfrm_input &&
++	    !route.tuple[IP_CT_DIR_ORIGINAL].xfrm_input_deferred &&
++	    !route.tuple[IP_CT_DIR_REPLY].xfrm_input_deferred)
++		goto err_flow_alloc;
++
+ 	flow = flow_offload_alloc(ct);
+ 	if (!flow)
+ 		goto err_flow_alloc;
+@@ -158,7 +196,9 @@ static void nft_flow_offload_eval(const struct nft_expr *expr,
+ 	if (tcph)
+ 		flow_offload_ct_tcp(ct);
+ 
+-	__set_bit(NF_FLOW_HW_BIDIRECTIONAL, &flow->flags);
++	if (!flow->tuplehash[FLOW_OFFLOAD_DIR_ORIGINAL].tuple.xfrm_input_deferred &&
++	    !flow->tuplehash[FLOW_OFFLOAD_DIR_REPLY].tuple.xfrm_input_deferred)
++		__set_bit(NF_FLOW_HW_BIDIRECTIONAL, &flow->flags);
+ 	ret = flow_offload_add(flowtable, flow);
+ 	if (ret < 0)
+ 		goto err_flow_add;
+@@ -170,6 +210,12 @@ static void nft_flow_offload_eval(const struct nft_expr *expr,
+ err_flow_alloc:
+ 	dst_release(route.tuple[dir].dst);
+ 	dst_release(route.tuple[!dir].dst);
++#if IS_ENABLED(CONFIG_XFRM)
++	if (route.tuple[dir].xfrm_input)
++		xfrm_state_put(route.tuple[dir].xfrm_input);
++	if (route.tuple[!dir].xfrm_input)
++		xfrm_state_put(route.tuple[!dir].xfrm_input);
++#endif
+ err_flow_route:
+ 	clear_bit(IPS_OFFLOAD_BIT, &ct->status);
+ out:

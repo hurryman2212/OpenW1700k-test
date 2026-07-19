@@ -1,0 +1,279 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jihong Min <hurryman2212@gmail.com>
+Date: Tue, 4 Aug 2026 16:29:39 +0900
+Subject: [PATCH] xfrm: manage packet offload device lifetime
+
+Coordinate packet-offload state ownership with network device lifetime.
+
+Assisted-by: Codex:gpt-5.6
+Signed-off-by: Jihong Min <hurryman2212@gmail.com>
+---
+ net/xfrm/xfrm_device.c | 161 +++++++++++++++++++++++++++++++++++------
+ 1 file changed, 139 insertions(+), 22 deletions(-)
+
+diff --git a/net/xfrm/xfrm_device.c b/net/xfrm/xfrm_device.c
+index 550457e..68c1210 100644
+--- a/net/xfrm/xfrm_device.c
++++ b/net/xfrm/xfrm_device.c
+@@ -14,6 +14,7 @@
+ #include <linux/skbuff.h>
+ #include <linux/slab.h>
+ #include <linux/spinlock.h>
++#include <linux/wait_bit.h>
+ #include <net/dst.h>
+ #include <net/gso.h>
+ #include <net/xfrm.h>
+@@ -232,6 +233,7 @@ int xfrm_dev_state_add(struct net *net, struct xfrm_state *x,
+ 		       struct xfrm_user_offload *xuo,
+ 		       struct netlink_ext_ack *extack)
+ {
++	const struct xfrmdev_ops *ops;
+ 	int err;
+ 	struct dst_entry *dst;
+ 	struct net_device *dev;
+@@ -292,14 +294,15 @@ int xfrm_dev_state_add(struct net *net, struct xfrm_state *x,
+ 		dst_release(dst);
+ 	}
+ 
+-	if (!dev->xfrmdev_ops || !dev->xfrmdev_ops->xdo_dev_state_add) {
++	ops = READ_ONCE(dev->xfrmdev_ops);
++	if (!ops || !ops->xdo_dev_state_add) {
+ 		xso->dev = NULL;
+ 		dev_put(dev);
+ 		return (is_packet_offload) ? -EINVAL : 0;
+ 	}
+ 
+ 	if (!is_packet_offload && x->props.flags & XFRM_STATE_ESN &&
+-	    !dev->xfrmdev_ops->xdo_dev_state_advance_esn) {
++	    !ops->xdo_dev_state_advance_esn) {
+ 		NL_SET_ERR_MSG(extack, "Device doesn't support offload with ESN");
+ 		xso->dev = NULL;
+ 		dev_put(dev);
+@@ -324,11 +327,13 @@ int xfrm_dev_state_add(struct net *net, struct xfrm_state *x,
+ 		xso->type = XFRM_DEV_OFFLOAD_PACKET;
+ 	else
+ 		xso->type = XFRM_DEV_OFFLOAD_CRYPTO;
++	xso->state_ops = ops;
+ 
+-	err = dev->xfrmdev_ops->xdo_dev_state_add(dev, x, extack);
++	err = ops->xdo_dev_state_add(dev, x, extack);
+ 	if (err) {
+ 		xso->dev = NULL;
+ 		xso->dir = 0;
++		xso->state_ops = NULL;
+ 		netdev_put(dev, &xso->dev_tracker);
+ 		xso->type = XFRM_DEV_OFFLOAD_UNSPECIFIED;
+ 
+@@ -351,6 +356,7 @@ int xfrm_dev_policy_add(struct net *net, struct xfrm_policy *xp,
+ 			struct xfrm_user_offload *xuo, u8 dir,
+ 			struct netlink_ext_ack *extack)
+ {
++	const struct xfrmdev_ops *ops;
+ 	struct xfrm_dev_offload *xdo = &xp->xdo;
+ 	struct net_device *dev;
+ 	int err;
+@@ -367,7 +373,8 @@ int xfrm_dev_policy_add(struct net *net, struct xfrm_policy *xp,
+ 	if (!dev)
+ 		return -EINVAL;
+ 
+-	if (!dev->xfrmdev_ops || !dev->xfrmdev_ops->xdo_dev_policy_add) {
++	ops = READ_ONCE(dev->xfrmdev_ops);
++	if (!ops || !ops->xdo_dev_policy_add) {
+ 		xdo->dev = NULL;
+ 		dev_put(dev);
+ 		NL_SET_ERR_MSG(extack, "Policy offload is not supported");
+@@ -394,7 +401,7 @@ int xfrm_dev_policy_add(struct net *net, struct xfrm_policy *xp,
+ 		return -EINVAL;
+ 	}
+ 
+-	err = dev->xfrmdev_ops->xdo_dev_policy_add(xp, extack);
++	err = ops->xdo_dev_policy_add(xp, extack);
+ 	if (err) {
+ 		xdo->dev = NULL;
+ 		xdo->type = XFRM_DEV_OFFLOAD_UNSPECIFIED;
+@@ -408,20 +415,119 @@ int xfrm_dev_policy_add(struct net *net, struct xfrm_policy *xp,
+ }
+ EXPORT_SYMBOL_GPL(xfrm_dev_policy_add);
+ 
++static bool xfrm_dev_offload_get_locked(struct xfrm_state *x)
++{
++	lockdep_assert_held(&x->lock);
++
++	if (x->km.state == XFRM_STATE_VALID && x->xso.dev &&
++	    atomic_inc_unless_negative(&x->xso.active_refs)) {
++		xfrm_state_hold(x);
++		return true;
++	}
++
++	return false;
++}
++
++bool xfrm_dev_offload_get(struct xfrm_state *x)
++{
++	bool held;
++
++	spin_lock_bh(&x->lock);
++	held = xfrm_dev_offload_get_locked(x);
++	spin_unlock_bh(&x->lock);
++
++	return held;
++}
++EXPORT_SYMBOL_GPL(xfrm_dev_offload_get);
++
++void xfrm_dev_offload_put(struct xfrm_state *x)
++{
++	atomic_dec_and_wake_up(&x->xso.active_refs);
++	xfrm_state_put(x);
++}
++EXPORT_SYMBOL_GPL(xfrm_dev_offload_put);
++
++void xfrm_dev_state_update_stats(struct xfrm_state *x)
++{
++	struct xfrm_dev_offload *xso = &x->xso;
++	const struct xfrmdev_ops *state_ops;
++	const struct xfrmdev_ops *ops;
++	struct net_device *dev;
++
++	/* The caller already pins x, but an unlocked dump still needs to keep
++	 * the device-private state alive against an early offload free.
++	 */
++	if (!atomic_inc_unless_negative(&xso->active_refs))
++		return;
++
++	dev = READ_ONCE(xso->dev);
++	state_ops = READ_ONCE(xso->state_ops);
++	if (dev && state_ops) {
++		ops = READ_ONCE(dev->xfrmdev_ops);
++		if (ops && ops == state_ops && ops->xdo_dev_state_update_stats)
++			ops->xdo_dev_state_update_stats(x);
++	}
++
++	atomic_dec_and_wake_up(&xso->active_refs);
++}
++EXPORT_SYMBOL_GPL(xfrm_dev_state_update_stats);
++
++void xfrm_dev_state_advance_esn(struct xfrm_state *x)
++{
++	struct xfrm_dev_offload *xso = &x->xso;
++	const struct xfrmdev_ops *state_ops;
++	const struct xfrmdev_ops *ops;
++	struct net_device *dev;
++
++	/* Replay updates run with x->lock held, so acquire only the private-state
++	 * lifetime reference here rather than recursing through the locking
++	 * xfrm_dev_offload_get() helper.
++	 */
++	if (!atomic_inc_unless_negative(&xso->active_refs))
++		return;
++
++	dev = READ_ONCE(xso->dev);
++	state_ops = READ_ONCE(xso->state_ops);
++	if (dev && state_ops) {
++		ops = READ_ONCE(dev->xfrmdev_ops);
++		if (ops && ops == state_ops && ops->xdo_dev_state_advance_esn)
++			ops->xdo_dev_state_advance_esn(x);
++	}
++
++	atomic_dec_and_wake_up(&xso->active_refs);
++}
++EXPORT_SYMBOL_GPL(xfrm_dev_state_advance_esn);
++
+ bool xfrm_dev_offload_ok(struct sk_buff *skb, struct xfrm_state *x)
+ {
+-	int mtu;
++	const struct xfrmdev_ops *ops;
+ 	struct dst_entry *dst = skb_dst(skb);
+ 	struct xfrm_dst *xdst = (struct xfrm_dst *)dst;
+-	struct net_device *dev = x->xso.dev;
++	struct net_device *dev;
+ 	bool check_tunnel_size;
++	bool offload_ok;
++	bool held;
++	u8 offload_type;
++	int mtu;
+ 
+-	if (!x->type_offload ||
+-	    (x->xso.type == XFRM_DEV_OFFLOAD_UNSPECIFIED && x->encap))
++	spin_lock_bh(&x->lock);
++	if (x->km.state != XFRM_STATE_VALID) {
++		spin_unlock_bh(&x->lock);
++		return false;
++	}
++	dev = x->xso.dev;
++	offload_type = x->xso.type;
++	held = xfrm_dev_offload_get_locked(x);
++	spin_unlock_bh(&x->lock);
++	if (dev && !held)
+ 		return false;
+ 
+-	if ((!dev || dev == xfrm_dst_path(dst)->dev) &&
+-	    !xdst->child->xfrm) {
++	offload_ok = false;
++	if (!x->type_offload ||
++	    (offload_type == XFRM_DEV_OFFLOAD_UNSPECIFIED && x->encap))
++		goto out;
++
++	if ((!dev || dev == xfrm_dst_path(dst)->dev) && !xdst->child->xfrm) {
+ 		mtu = xfrm_state_mtu(x, xdst->child_mtu_cached);
+ 		if (skb->len <= mtu)
+ 			goto ok;
+@@ -430,37 +536,48 @@ bool xfrm_dev_offload_ok(struct sk_buff *skb, struct xfrm_state *x)
+ 			goto ok;
+ 	}
+ 
+-	return false;
++	goto out;
+ 
+ ok:
+-	if (!dev)
+-		return true;
++	if (!dev) {
++		offload_ok = true;
++		goto out;
++	}
+ 
+-	check_tunnel_size = x->xso.type == XFRM_DEV_OFFLOAD_PACKET &&
++	check_tunnel_size = offload_type == XFRM_DEV_OFFLOAD_PACKET &&
+ 			    x->props.mode == XFRM_MODE_TUNNEL;
+ 	switch (skb_dst(skb)->ops->family) {
+ 	case AF_INET:
+ 		/* Check for IPv4 options */
+ 		if (ip_hdr(skb)->ihl != 5)
+-			return false;
++			goto out;
+ 		if (check_tunnel_size && xfrm4_tunnel_check_size(skb))
+-			return false;
++			goto out;
+ 		break;
+ 	case AF_INET6:
+ 		/* Check for IPv6 extensions */
+ 		if (ipv6_ext_hdr(ipv6_hdr(skb)->nexthdr))
+-			return false;
++			goto out;
+ 		if (check_tunnel_size && xfrm6_tunnel_check_size(skb))
+-			return false;
++			goto out;
+ 		break;
+ 	default:
+ 		break;
+ 	}
+ 
+-	if (dev->xfrmdev_ops->xdo_dev_offload_ok)
+-		return dev->xfrmdev_ops->xdo_dev_offload_ok(skb, x);
++	ops = READ_ONCE(dev->xfrmdev_ops);
++	if (!ops || ops != READ_ONCE(x->xso.state_ops))
++		offload_ok = false;
++	else if (ops->xdo_dev_offload_ok)
++		offload_ok = ops->xdo_dev_offload_ok(skb, x);
++	else
++		offload_ok = true;
++
++out:
++	if (held)
++		xfrm_dev_offload_put(x);
+ 
+-	return true;
++	return offload_ok;
+ }
+ EXPORT_SYMBOL_GPL(xfrm_dev_offload_ok);
+ 

@@ -1,0 +1,54 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jihong Min <hurryman2212@gmail.com>
+Date: Tue, 4 Aug 2026 16:29:39 +0900
+Subject: [PATCH] net: airoha: pass flowtable context through offload API
+
+Pass flowtable origin and flow metadata through the Airoha offload interface.
+
+Assisted-by: Codex:gpt-5.6
+Signed-off-by: Jihong Min <hurryman2212@gmail.com>
+---
+ include/linux/soc/airoha/airoha_offload.h | 16 ++++++++++++++--
+ 1 file changed, 14 insertions(+), 2 deletions(-)
+
+diff --git a/include/linux/soc/airoha/airoha_offload.h b/include/linux/soc/airoha/airoha_offload.h
+index 681d929..5861706 100644
+--- a/include/linux/soc/airoha/airoha_offload.h
++++ b/include/linux/soc/airoha/airoha_offload.h
+@@ -18,7 +18,7 @@ enum {
+ struct airoha_ppe_dev {
+ 	struct {
+ 		int (*setup_tc_block_cb)(struct airoha_ppe_dev *dev,
+-					 void *type_data);
++					 void *type_data, bool is_flowtable);
+ 		void (*check_skb)(struct airoha_ppe_dev *dev,
+ 				  struct sk_buff *skb, u16 hash,
+ 				  bool rx_wlan);
+@@ -36,7 +36,13 @@ void airoha_ppe_put_dev(struct airoha_ppe_dev *dev);
+ static inline int airoha_ppe_dev_setup_tc_block_cb(struct airoha_ppe_dev *dev,
+ 						   void *type_data)
+ {
+-	return dev->ops.setup_tc_block_cb(dev, type_data);
++	return dev->ops.setup_tc_block_cb(dev, type_data, false);
++}
++
++static inline int airoha_ppe_dev_setup_ft_block_cb(struct airoha_ppe_dev *dev,
++						   void *type_data)
++{
++	return dev->ops.setup_tc_block_cb(dev, type_data, true);
+ }
+ 
+ static inline void airoha_ppe_dev_check_skb(struct airoha_ppe_dev *dev,
+@@ -68,6 +74,12 @@ static inline int airoha_ppe_dev_setup_tc_block_cb(struct airoha_ppe_dev *dev,
+ 	return -EOPNOTSUPP;
+ }
+ 
++static inline int airoha_ppe_dev_setup_ft_block_cb(struct airoha_ppe_dev *dev,
++						   void *type_data)
++{
++	return -EOPNOTSUPP;
++}
++
+ static inline void airoha_ppe_dev_check_skb(struct airoha_ppe_dev *dev,
+ 					    struct sk_buff *skb, u16 hash,
+ 					    bool rx_wlan)

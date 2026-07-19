@@ -1,0 +1,25 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jihong Min <hurryman2212@gmail.com>
+Date: Tue, 4 Aug 2026 16:29:39 +0900
+Subject: [PATCH] MAINTAINERS: cover Airoha EN7581 SOE binding
+
+Add the EN7581 SOE binding to the Airoha Ethernet driver entry.
+
+Assisted-by: Codex:gpt-5.6
+Signed-off-by: Jihong Min <hurryman2212@gmail.com>
+---
+ MAINTAINERS | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/MAINTAINERS b/MAINTAINERS
+index 2602d12..ad463c1 100644
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -744,6 +744,7 @@ L:	linux-mediatek@lists.infradead.org (moderated for non-subscribers)
+ L:	netdev@vger.kernel.org
+ S:	Maintained
+ F:	Documentation/devicetree/bindings/net/airoha,en7581-eth.yaml
++F:	Documentation/devicetree/bindings/net/airoha,en7581-soe.yaml
+ F:	drivers/net/ethernet/airoha/
+ 
+ AIROHA PCIE PHY DRIVER

@@ -1,0 +1,104 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jihong Min <hurryman2212@gmail.com>
+Date: Tue, 4 Aug 2026 16:29:39 +0900
+Subject: [PATCH] net: airoha: add SOE and PPE IPsec register definitions
+
+Define the EN7581 SOE registers and the PPE fields used by IPsec flows.
+
+Assisted-by: Codex:gpt-5.6
+Signed-off-by: Jihong Min <hurryman2212@gmail.com>
+---
+ drivers/net/ethernet/airoha/airoha_regs.h | 45 +++++++++++++++++++++++
+ 1 file changed, 45 insertions(+)
+
+diff --git a/drivers/net/ethernet/airoha/airoha_regs.h b/drivers/net/ethernet/airoha/airoha_regs.h
+index caa0b95..1944257 100644
+--- a/drivers/net/ethernet/airoha/airoha_regs.h
++++ b/drivers/net/ethernet/airoha/airoha_regs.h
+@@ -82,6 +82,10 @@
+ #define PSE_SHARE_USED_MTHD_MASK	GENMASK(31, 16)
+ #define PSE_SHARE_USED_HTHD_MASK	GENMASK(15, 0)
+ 
++/* TDMA/SOE port 7 needs shared-buffer flow control enabled in the PSE. */
++#define REG_PSE_FC_CFG			0x0098
++#define PSE_TDMA_SHARE_BUF_DIS_MASK	BIT(23)
++
+ #define REG_GDM_MISC_CFG		0x0148
+ #define GDM2_RDM_ACK_WAIT_PREF_MASK	BIT(9)
+ #define GDM2_CHN_VLD_MODE_MASK		BIT(5)
+@@ -89,6 +93,37 @@
+ #define REG_FE_CSR_IFC_CFG		CSR_IFC_BASE
+ #define FE_IFC_EN_MASK			BIT(0)
+ 
++#define REG_FE_CSR_IFC_CTRL		(CSR_IFC_BASE + 0x04)
++#define FE_IFC_CTRL_ACK_MASK		BIT(31)
++#define FE_IFC_CTRL_ID_MASK		GENMASK(24, 16)
++#define FE_IFC_CTRL_OFFSET_MASK		GENMASK(11, 8)
++#define FE_IFC_CTRL_TABLE_MASK		GENMASK(6, 4)
++#define FE_IFC_CTRL_CMD_MASK		GENMASK(2, 1)
++#define FE_IFC_CTRL_REQ_MASK		BIT(0)
++#define FE_IFC_TCAM_NUM_ENTRIES		64
++
++#define REG_FE_CSR_IFC_DATA(_n)		(CSR_IFC_BASE + 0x10 + ((_n) << 2))
++#define REG_FE_CSR_IFC_UDF(_n)		(CSR_IFC_BASE + 0x20 + ((_n) << 2))
++#define FE_IFC_UDF0_BASE_MASK		GENMASK(1, 0)
++#define FE_IFC_UDF0_OFFSET_MASK		GENMASK(15, 2)
++#define FE_IFC_UDF1_BASE_MASK		GENMASK(17, 16)
++#define FE_IFC_UDF1_OFFSET_MASK		GENMASK(31, 18)
++
++#define FE_IFC_TCAM_IPV4_VALID_MASK	BIT(1)
++#define FE_IFC_TCAM_RULE_TYPE_MASK	GENMASK(7, 6)
++#define FE_IFC_TCAM_DPORT_MASK		GENMASK(15, 0)
++#define FE_IFC_TCAM_IPV4_PROTOCOL_MASK	GENMASK(7, 0)
++
++#define FE_IFC_LUT1_FIELD_MASK		GENMASK(5, 0)
++#define FE_IFC_LUT1_RULE_END_MASK	BIT(14)
++#define FE_IFC_LUT1_RULE_VALID_MASK	BIT(15)
++#define FE_IFC_LUT1_MASK_MASK		GENMASK(31, 16)
++
++#define FE_IFC_ACT_NBQ_MASK		GENMASK(14, 10)
++#define FE_IFC_ACT_FORCE_CPU_MASK	BIT(28)
++#define FE_IFC_ACT_RULE_END_MASK		BIT(30)
++#define FE_IFC_ACT_RULE_EN_MASK		BIT(31)
++
+ #define REG_FE_VIP_PORT_EN		0x01f0
+ #define REG_FE_IFC_PORT_EN		0x01f4
+ 
+@@ -266,6 +301,7 @@
+ #define PPE_GLO_CFG_EN_MASK			BIT(0)
+ 
+ #define REG_PPE_PPE_FLOW_CFG(_n)		(((_n) ? PPE2_BASE : PPE1_BASE) + 0x204)
++#define PPE_FLOW_CFG_IP4_IPSEC_MASK		BIT(27)
+ #define PPE_FLOW_CFG_IP6_HASH_GRE_KEY_MASK	BIT(20)
+ #define PPE_FLOW_CFG_IP4_HASH_GRE_KEY_MASK	BIT(19)
+ #define PPE_FLOW_CFG_IP4_HASH_FLOW_LABEL_MASK	BIT(18)
+@@ -881,6 +917,8 @@
+ #define QDMA_DESC_NEXT_ID_MASK		GENMASK(15, 0)
+ /* TX MSG0 */
+ #define QDMA_ETH_TXMSG_MIC_IDX_MASK	BIT(30)
++/* SOE submit metadata: msg0 carries SA index, msg1 selects port 7 OQ8/OQ9. */
++#define QDMA_ETH_TXMSG_SOE_SA_MASK	GENMASK(29, 24)
+ #define QDMA_ETH_TXMSG_SP_TAG_MASK	GENMASK(29, 14)
+ #define QDMA_ETH_TXMSG_ICO_MASK		BIT(13)
+ #define QDMA_ETH_TXMSG_UCO_MASK		BIT(12)
+@@ -903,6 +941,10 @@
+ 
+ /* RX MSG0 */
+ #define QDMA_ETH_RXMSG_SPTAG		GENMASK(21, 14)
++/* SOE completion metadata returned by the QDMA RX descriptor. */
++#define QDMA_ETH_RXMSG_HOP_FLAGS_MASK	GENMASK(2, 0)
++#define QDMA_ETH_RXMSG_HOP_ENCRYPTED	3
++#define QDMA_ETH_RXMSG_HOP_ERROR_LAST	7
+ /* RX MSG1 */
+ #define QDMA_ETH_RXMSG_DEI_MASK		BIT(31)
+ #define QDMA_ETH_RXMSG_IP6_MASK		BIT(30)
+@@ -919,6 +961,9 @@
+ /* RX MSG3 */
+ #define QDMA_ETH_RXMSG_AGG_LEN_MASK	GENMASK(31, 16)
+ #define QDMA_ETH_RXMSG_TCP_WIN_MASK	GENMASK(15, 0)
++/* RX MSG2 */
++/* SW_UDF carries the SA index and request sequence for SOE completions. */
++#define QDMA_ETH_RXMSG_SW_UDF_MASK	GENMASK(31, 24)
+ 
+ struct airoha_qdma_desc {
+ 	__le32 tcp_ts_reply;

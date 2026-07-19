@@ -1,0 +1,160 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jihong Min <hurryman2212@gmail.com>
+Date: Tue, 4 Aug 2026 16:29:39 +0900
+Subject: [PATCH] netfilter: flowtable: discover XFRM state for flow
+ routes
+
+Discover authenticated inbound and eligible outbound XFRM state while resolving flow routes.
+
+Assisted-by: Codex:gpt-5.6
+Signed-off-by: Jihong Min <hurryman2212@gmail.com>
+---
+ net/netfilter/nf_flow_table_path.c | 94 ++++++++++++++++++++++++++++--
+ 1 file changed, 90 insertions(+), 4 deletions(-)
+
+diff --git a/net/netfilter/nf_flow_table_path.c b/net/netfilter/nf_flow_table_path.c
+index 10ef70c..5469be6 100644
+--- a/net/netfilter/nf_flow_table_path.c
++++ b/net/netfilter/nf_flow_table_path.c
+@@ -14,6 +14,7 @@
+ #include <net/netfilter/nf_conntrack_core.h>
+ #include <net/netfilter/nf_conntrack_extend.h>
+ #include <net/netfilter/nf_flow_table.h>
++#include <net/xfrm.h>
+ #include <linux/if_bridge.h>
+ #include <linux/if_ether.h>
+ #include <net/route.h>
+@@ -28,6 +29,24 @@ static enum flow_offload_xmit_type nft_xmit_type(struct dst_entry *dst)
+ 	return FLOW_OFFLOAD_XMIT_NEIGH;
+ }
+ 
++#if IS_ENABLED(CONFIG_XFRM)
++static bool nft_flow_route_needs_xfrm_input(const struct nf_flow_route *route,
++					    enum ip_conntrack_dir dir)
++{
++	const struct dst_entry *dst = route->tuple[dir].dst;
++	const struct xfrm_state *x;
++
++	if (route->tuple[dir].xmit_type != FLOW_OFFLOAD_XMIT_XFRM)
++		return false;
++
++	x = dst_xfrm(dst);
++	if (x && x->xso.flags & XFRM_DEV_OFFLOAD_FLAG_FLOWTABLE_INPUT)
++		return true;
++
++	return false;
++}
++#endif
++
+ static void nft_default_forward_path(struct nf_flow_route *route,
+ 				     struct dst_entry *dst_cache,
+ 				     enum ip_conntrack_dir dir)
+@@ -352,6 +371,10 @@ int nft_flow_route_routing(const struct nft_pktinfo *pkt,
+ {
+ 	struct dst_entry *this_dst = skb_dst(pkt->skb);
+ 	struct dst_entry *other_dst = NULL;
++#if IS_ENABLED(CONFIG_XFRM)
++	struct xfrm_offload *xo;
++	struct sec_path *sp;
++#endif
+ 	struct flowi fl;
+ 
+ 	if (!this_dst)
+@@ -367,6 +390,10 @@ int nft_flow_route_routing(const struct nft_pktinfo *pkt,
+ 		fl.u.ip4.flowi4_dscp = ip4h_dscp(ip_hdr(pkt->skb));
+ 		fl.u.ip4.flowi4_mark = pkt->skb->mark;
+ 		fl.u.ip4.flowi4_flags = FLOWI_FLAG_ANYSRC;
++		fl.u.ip4.flowi4_proto =
++			ct->tuplehash[!dir].tuple.dst.protonum;
++		fl.u.ip4.fl4_sport = ct->tuplehash[!dir].tuple.src.u.all;
++		fl.u.ip4.fl4_dport = ct->tuplehash[dir].tuple.src.u.all;
+ 		break;
+ 	case NFPROTO_IPV6:
+ 		fl.u.ip6.daddr = ct->tuplehash[dir].tuple.src.u3.in6;
+@@ -376,6 +403,10 @@ int nft_flow_route_routing(const struct nft_pktinfo *pkt,
+ 		fl.u.ip6.flowlabel = ip6_flowinfo(ipv6_hdr(pkt->skb));
+ 		fl.u.ip6.flowi6_mark = pkt->skb->mark;
+ 		fl.u.ip6.flowi6_flags = FLOWI_FLAG_ANYSRC;
++		fl.u.ip6.flowi6_proto =
++			ct->tuplehash[!dir].tuple.dst.protonum;
++		fl.u.ip6.fl6_sport = ct->tuplehash[!dir].tuple.src.u.all;
++		fl.u.ip6.fl6_dport = ct->tuplehash[dir].tuple.src.u.all;
+ 		break;
+ 	}
+ 
+@@ -388,16 +419,71 @@ int nft_flow_route_routing(const struct nft_pktinfo *pkt,
+ 		return -ENOENT;
+ 	}
+ 
++#if IS_ENABLED(CONFIG_XFRM)
++	sp = skb_sec_path(pkt->skb);
++	xo = xfrm_input_offload(pkt->skb);
++	if (sp && xo && (xo->flags & XFRM_HW_FLOW_ID)) {
++		struct xfrm_state *x = sp->xvec[sp->len - 1];
++
++		other_dst = xfrm_lookup(nft_net(pkt), other_dst, &fl, NULL, 0);
++		if (IS_ERR(other_dst)) {
++			dst_release(this_dst);
++			return -ENOENT;
++		}
++
++		xfrm_state_hold(x);
++		route->tuple[dir].xfrm_input = x;
++		route->tuple[dir].xfrm_input_flow_id = xo->hw_flow_id;
++		route->tuple[dir].xfrm_policy_genid = sp->policy_genid;
++		route->tuple[!dir].xfrm_policy_genid = sp->policy_genid;
++	}
++#endif
++
+ 	nft_default_forward_path(route, this_dst, dir);
+ 	nft_default_forward_path(route, other_dst, !dir);
+ 
+-	if (route->tuple[dir].xmit_type == FLOW_OFFLOAD_XMIT_NEIGH &&
+-	    route->tuple[!dir].xmit_type == FLOW_OFFLOAD_XMIT_NEIGH) {
+-		nft_dev_forward_path(pkt, false, route, ct, dir, ft);
+-		nft_dev_forward_path(pkt, false, route, ct, !dir, ft);
++#if IS_ENABLED(CONFIG_XFRM)
++	if (!route->tuple[dir].xfrm_input) {
++		if (nft_flow_route_needs_xfrm_input(route, !dir))
++			goto err_dst_release;
++
++		if (nft_flow_route_needs_xfrm_input(route, dir)) {
++			u32 genid;
++
++			/* Only an unmarked, locally initiated flow with a verified
++			 * output policy may precede its authenticated input path.
++			 */
++			if (dir != IP_CT_DIR_ORIGINAL || pkt->skb->mark ||
++			    !xfrm_policy_flowtable_eligible(nft_net(pkt)))
++				goto err_dst_release;
++
++			genid = xfrm_policy_generation(nft_net(pkt));
++			route->tuple[dir].xfrm_policy_genid = genid;
++			route->tuple[!dir].xfrm_policy_genid = genid;
++			route->tuple[!dir].xfrm_input_deferred = true;
++		}
+ 	}
++#endif
++
++	if (route->tuple[dir].xmit_type == FLOW_OFFLOAD_XMIT_NEIGH &&
++	    nft_dev_forward_path(pkt, false, route, ct, dir, ft) < 0)
++		goto err_dst_release;
++	if (route->tuple[!dir].xmit_type == FLOW_OFFLOAD_XMIT_NEIGH &&
++	    nft_dev_forward_path(pkt, false, route, ct, !dir, ft) < 0)
++		goto err_dst_release;
+ 
+ 	return 0;
++
++err_dst_release:
++	dst_release(route->tuple[dir].dst);
++	dst_release(route->tuple[!dir].dst);
++#if IS_ENABLED(CONFIG_XFRM)
++	if (route->tuple[dir].xfrm_input) {
++		xfrm_state_put(route->tuple[dir].xfrm_input);
++		route->tuple[dir].xfrm_input = NULL;
++	}
++#endif
++	return -ENOENT;
+ }
+ 
+ int nft_flow_route_bridging(const struct nft_pktinfo *pkt,

@@ -1,0 +1,47 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jihong Min <hurryman2212@gmail.com>
+Date: Tue, 4 Aug 2026 16:29:39 +0900
+Subject: [PATCH] xfrm: preserve packet offload ownership on user updates
+
+Preserve packet-offload ownership while userspace updates XFRM state.
+
+Assisted-by: Codex:gpt-5.6
+Signed-off-by: Jihong Min <hurryman2212@gmail.com>
+---
+ net/xfrm/xfrm_user.c | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/net/xfrm/xfrm_user.c b/net/xfrm/xfrm_user.c
+index 9ad6619..726440b 100644
+--- a/net/xfrm/xfrm_user.c
++++ b/net/xfrm/xfrm_user.c
+@@ -1000,6 +1000,7 @@ static struct xfrm_state *xfrm_state_construct(struct net *net,
+ 
+ error:
+ 	x->km.state = XFRM_STATE_DEAD;
++	xfrm_dev_state_delete(x);
+ 	xfrm_state_put(x);
+ error_no_put:
+ 	*errp = err;
+@@ -2501,6 +2502,10 @@ static int xfrm_set_default(struct sk_buff *skb, struct nlmsghdr *nlh,
+ 	struct net *net = sock_net(skb->sk);
+ 	struct xfrm_userpolicy_default *up = nlmsg_data(nlh);
+ 
++	spin_lock_bh(&net->xfrm.xfrm_policy_lock);
++	xfrm_policy_change_begin(net);
++	spin_unlock_bh(&net->xfrm.xfrm_policy_lock);
++
+ 	if (xfrm_userpolicy_is_valid(up->in))
+ 		WRITE_ONCE(net->xfrm.policy_default[XFRM_POLICY_IN], up->in);
+ 
+@@ -2512,6 +2517,10 @@ static int xfrm_set_default(struct sk_buff *skb, struct nlmsghdr *nlh,
+ 
+ 	rt_genid_bump_all(net);
+ 
++	spin_lock_bh(&net->xfrm.xfrm_policy_lock);
++	xfrm_policy_change_end(net);
++	spin_unlock_bh(&net->xfrm.xfrm_policy_lock);
++
+ 	xfrm_notify_userpolicy(net);
+ 	return 0;
+ }

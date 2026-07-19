@@ -1,0 +1,210 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jihong Min <hurryman2212@gmail.com>
+Date: Tue, 4 Aug 2026 16:29:39 +0900
+Subject: [PATCH] netfilter: flowtable: emit XFRM hardware actions
+
+Emit XFRM metadata for hardware-offloaded flowtable directions.
+
+Assisted-by: Codex:gpt-5.6
+Signed-off-by: Jihong Min <hurryman2212@gmail.com>
+---
+ net/netfilter/nf_flow_table_offload.c | 123 ++++++++++++++++++++++++++
+ 1 file changed, 123 insertions(+)
+
+diff --git a/net/netfilter/nf_flow_table_offload.c b/net/netfilter/nf_flow_table_offload.c
+index 4a5be76..e587ab8 100644
+--- a/net/netfilter/nf_flow_table_offload.c
++++ b/net/netfilter/nf_flow_table_offload.c
+@@ -12,6 +12,9 @@
+ #include <net/netfilter/nf_conntrack_acct.h>
+ #include <net/netfilter/nf_conntrack_core.h>
+ #include <net/netfilter/nf_conntrack_tuple.h>
++#include <net/ip6_route.h>
++#include <net/route.h>
++#include <net/xfrm.h>
+ 
+ #define NF_FLOW_RULE_ACTION_MAX	24
+ 
+@@ -232,6 +235,63 @@ flow_action_entry_next(struct nf_flow_rule *flow_rule)
+ 	return &flow_rule->rule->action.entries[i];
+ }
+ 
++static struct dst_entry *
++flow_offload_xfrm_path(const struct flow_offload_tuple *tuple)
++{
++	struct dst_entry *child;
++
++	if (!tuple->dst_cache || !dst_xfrm(tuple->dst_cache))
++		return NULL;
++
++	child = xfrm_dst_child(tuple->dst_cache);
++	if (!child || dst_xfrm(child))
++		return NULL;
++
++	return xfrm_dst_path(tuple->dst_cache);
++}
++
++static int flow_offload_xfrm(const struct flow_offload *flow,
++			     enum flow_offload_tuple_dir dir,
++			     struct nf_flow_rule *flow_rule)
++{
++	const struct flow_offload_tuple *tuple =
++		&flow->tuplehash[dir].tuple;
++	struct flow_action_entry *entry;
++	struct xfrm_state *x;
++	u8 xfrm_dir;
++
++	if (tuple->xfrm_input &&
++	    tuple->xmit_type == FLOW_OFFLOAD_XMIT_XFRM)
++		return -EOPNOTSUPP;
++
++	if (tuple->xfrm_input) {
++		x = tuple->xfrm_input;
++		xfrm_dir = XFRM_DEV_OFFLOAD_IN;
++	} else if (tuple->xmit_type == FLOW_OFFLOAD_XMIT_XFRM) {
++		if (!flow_offload_xfrm_path(tuple))
++			return -EOPNOTSUPP;
++		x = dst_xfrm(tuple->dst_cache);
++		xfrm_dir = XFRM_DEV_OFFLOAD_OUT;
++	} else {
++		return 0;
++	}
++
++	entry = flow_action_entry_next(flow_rule);
++	if (!entry)
++		return -E2BIG;
++
++	entry->id = FLOW_ACTION_XFRM;
++	entry->xfrm.state = x;
++	entry->xfrm.dir = xfrm_dir;
++	entry->xfrm.policy_genid = tuple->xfrm_policy_genid;
++	if (xfrm_dir == XFRM_DEV_OFFLOAD_IN) {
++		entry->xfrm.flow_id = tuple->xfrm_input_flow_id;
++		entry->xfrm.flow_id_valid = true;
++	}
++
++	return 0;
++}
++
+ static int flow_offload_eth_src(struct net *net,
+ 				const struct flow_offload *flow,
+ 				enum flow_offload_tuple_dir dir,
+@@ -240,6 +300,7 @@ static int flow_offload_eth_src(struct net *net,
+ 	struct flow_action_entry *entry0 = flow_action_entry_next(flow_rule);
+ 	struct flow_action_entry *entry1 = flow_action_entry_next(flow_rule);
+ 	const struct flow_offload_tuple *other_tuple, *this_tuple;
++	struct dst_entry *dst;
+ 	struct net_device *dev = NULL;
+ 	const unsigned char *addr;
+ 	u32 mask, val;
+@@ -254,6 +315,15 @@ static int flow_offload_eth_src(struct net *net,
+ 	case FLOW_OFFLOAD_XMIT_DIRECT:
+ 		addr = this_tuple->out.h_source;
+ 		break;
++	case FLOW_OFFLOAD_XMIT_XFRM:
++		dst = flow_offload_xfrm_path(this_tuple);
++		if (!dst || !dst->dev)
++			return -EOPNOTSUPP;
++
++		dev = dst->dev;
++		dev_hold(dev);
++		addr = dev->dev_addr;
++		break;
+ 	case FLOW_OFFLOAD_XMIT_NEIGH:
+ 		other_tuple = &flow->tuplehash[!dir].tuple;
+ 		dev = dev_get_by_index(net, other_tuple->iifidx);
+@@ -307,6 +377,42 @@ static int flow_offload_eth_dst(struct net *net,
+ 	case FLOW_OFFLOAD_XMIT_DIRECT:
+ 		ether_addr_copy(ha, this_tuple->out.h_dest);
+ 		break;
++	case FLOW_OFFLOAD_XMIT_XFRM: {
++		struct xfrm_state *x = dst_xfrm(this_tuple->dst_cache);
++		__be32 nexthop;
++
++		dst_cache = flow_offload_xfrm_path(this_tuple);
++		if (!dst_cache || !x)
++			return -EOPNOTSUPP;
++
++		switch (x->props.family) {
++		case AF_INET:
++			nexthop = rt_nexthop(dst_rtable(dst_cache),
++					     x->id.daddr.a4);
++			daddr = &nexthop;
++			break;
++		case AF_INET6:
++			daddr = rt6_nexthop(dst_rt6_info(dst_cache),
++					    &x->id.daddr.in6);
++			break;
++		default:
++			return -EOPNOTSUPP;
++		}
++
++		n = dst_neigh_lookup(dst_cache, daddr);
++		if (!n)
++			return -ENOENT;
++
++		read_lock_bh(&n->lock);
++		nud_state = n->nud_state;
++		ether_addr_copy(ha, n->ha);
++		read_unlock_bh(&n->lock);
++		neigh_release(n);
++
++		if (!(nud_state & NUD_VALID))
++			return -ENOENT;
++		break;
++	}
+ 	case FLOW_OFFLOAD_XMIT_NEIGH:
+ 		other_tuple = &flow->tuplehash[!dir].tuple;
+ 		daddr = &other_tuple->src_v4;
+@@ -601,6 +707,14 @@ static int flow_offload_redirect(struct net *net,
+ 		this_tuple = &flow->tuplehash[dir].tuple;
+ 		ifindex = this_tuple->out.hw_ifidx;
+ 		break;
++	case FLOW_OFFLOAD_XMIT_XFRM: {
++		struct dst_entry *dst = flow_offload_xfrm_path(this_tuple);
++
++		if (!dst || !dst->dev)
++			return -EOPNOTSUPP;
++		ifindex = dst->dev->ifindex;
++		break;
++	}
+ 	case FLOW_OFFLOAD_XMIT_NEIGH:
+ 		other_tuple = &flow->tuplehash[!dir].tuple;
+ 		ifindex = other_tuple->iifidx;
+@@ -638,6 +752,8 @@ static int flow_offload_encap_tunnel(const struct flow_offload *flow,
+ 		return 0;
+ 
+ 	dst = this_tuple->dst_cache;
++	if (this_tuple->xmit_type == FLOW_OFFLOAD_XMIT_XFRM)
++		dst = flow_offload_xfrm_path(this_tuple);
+ 	if (dst && dst->lwtstate) {
+ 		struct ip_tunnel_info *tun_info;
+ 
+@@ -667,6 +783,8 @@ static int flow_offload_decap_tunnel(const struct flow_offload *flow,
+ 		return 0;
+ 
+ 	dst = other_tuple->dst_cache;
++	if (other_tuple->xmit_type == FLOW_OFFLOAD_XMIT_XFRM)
++		dst = flow_offload_xfrm_path(other_tuple);
+ 	if (dst && dst->lwtstate) {
+ 		struct ip_tunnel_info *tun_info;
+ 
+@@ -740,6 +858,9 @@ nf_flow_rule_route_common(struct net *net, const struct flow_offload *flow,
+ 		}
+ 	}
+ 
++	if (flow_offload_xfrm(flow, dir, flow_rule) < 0)
++		return -1;
++
+ 	return 0;
+ }
+ 
+@@ -825,6 +946,8 @@ nf_flow_offload_rule_alloc(struct net *net,
+ 	other_tuple = &flow->tuplehash[!dir].tuple;
+ 	if (other_tuple->xmit_type == FLOW_OFFLOAD_XMIT_NEIGH)
+ 		other_dst = other_tuple->dst_cache;
++	else if (other_tuple->xmit_type == FLOW_OFFLOAD_XMIT_XFRM)
++		other_dst = flow_offload_xfrm_path(other_tuple);
+ 
+ 	err = nf_flow_rule_match(&flow_rule->match, tuple, other_dst);
+ 	if (err < 0)

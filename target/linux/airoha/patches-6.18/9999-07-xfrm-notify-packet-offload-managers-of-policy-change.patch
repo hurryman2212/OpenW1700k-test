@@ -1,0 +1,301 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jihong Min <hurryman2212@gmail.com>
+Date: Tue, 4 Aug 2026 16:29:39 +0900
+Subject: [PATCH] xfrm: notify packet offload managers of policy changes
+
+Notify packet-offload managers when policy state changes and track unsafe policies.
+
+Assisted-by: Codex:gpt-5.6
+Signed-off-by: Jihong Min <hurryman2212@gmail.com>
+---
+ net/xfrm/xfrm_policy.c | 105 ++++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 99 insertions(+), 6 deletions(-)
+
+diff --git a/net/xfrm/xfrm_policy.c b/net/xfrm/xfrm_policy.c
+index 4dad1f8..6aa6129 100644
+--- a/net/xfrm/xfrm_policy.c
++++ b/net/xfrm/xfrm_policy.c
+@@ -1569,6 +1569,32 @@ static struct xfrm_policy *xfrm_policy_insert_list(struct hlist_head *chain,
+ 	return delpol;
+ }
+ 
++/* Called with net->xfrm.xfrm_policy_lock held. */
++static bool xfrm_dev_policy_offload_active(struct xfrm_policy *policy)
++{
++	lockdep_assert_held(&xp_net(policy)->xfrm.xfrm_policy_lock);
++
++#ifdef CONFIG_XFRM_OFFLOAD
++	const struct xfrmdev_ops *ops;
++	struct net_device *dev;
++
++	if (policy->xdo.type != XFRM_DEV_OFFLOAD_PACKET)
++		return true;
++
++	dev = READ_ONCE(policy->xdo.dev);
++	if (!dev || !net_eq(dev_net(dev), xp_net(policy)) ||
++	    READ_ONCE(dev->reg_state) != NETREG_REGISTERED ||
++	    READ_ONCE(dev->moving_ns) ||
++	    !(READ_ONCE(dev->features) & NETIF_F_HW_ESP))
++		return false;
++
++	ops = READ_ONCE(dev->xfrmdev_ops);
++	return ops && ops->xdo_dev_policy_add;
++#else
++	return true;
++#endif
++}
++
+ int xfrm_policy_insert(int dir, struct xfrm_policy *policy, int excl)
+ {
+ 	struct net *net = xp_net(policy);
+@@ -1579,6 +1605,11 @@ int xfrm_policy_insert(int dir, struct xfrm_policy *policy, int excl)
+ 	policy->mark.v &= policy->mark.m;
+ 
+ 	spin_lock_bh(&net->xfrm.xfrm_policy_lock);
++	if (!xfrm_dev_policy_offload_active(policy)) {
++		spin_unlock_bh(&net->xfrm.xfrm_policy_lock);
++		return -ENODEV;
++	}
++	xfrm_policy_change_begin(net);
+ 	chain = policy_hash_bysel(net, &policy->selector, policy->family, dir);
+ 	if (chain)
+ 		delpol = xfrm_policy_insert_list(chain, policy, excl);
+@@ -1586,6 +1617,7 @@ int xfrm_policy_insert(int dir, struct xfrm_policy *policy, int excl)
+ 		delpol = xfrm_policy_inexact_insert(policy, dir, excl);
+ 
+ 	if (IS_ERR(delpol)) {
++		xfrm_policy_change_end(net);
+ 		spin_unlock_bh(&net->xfrm.xfrm_policy_lock);
+ 		return PTR_ERR(delpol);
+ 	}
+@@ -1608,6 +1640,7 @@ int xfrm_policy_insert(int dir, struct xfrm_policy *policy, int excl)
+ 	policy->curlft.use_time = 0;
+ 	if (!mod_timer(&policy->timer, jiffies + HZ))
+ 		xfrm_pol_hold(policy);
++	xfrm_policy_change_end(net);
+ 	spin_unlock_bh(&net->xfrm.xfrm_policy_lock);
+ 
+ 	if (delpol)
+@@ -1697,12 +1730,15 @@ xfrm_policy_bysel_ctx(struct net *net, const struct xfrm_mark *mark, u32 if_id,
+ 				spin_unlock_bh(&net->xfrm.xfrm_policy_lock);
+ 				return pol;
+ 			}
++			xfrm_policy_change_begin(net);
+ 			__xfrm_policy_unlink(pol, dir);
+ 		}
+ 		ret = pol;
+ 	}
+ 	if (bin && delete)
+ 		__xfrm_policy_inexact_prune_bin(bin, false);
++	if (ret && delete)
++		xfrm_policy_change_end(net);
+ 	spin_unlock_bh(&net->xfrm.xfrm_policy_lock);
+ 
+ 	if (ret && delete)
+@@ -1737,12 +1773,15 @@ xfrm_policy_byid(struct net *net, const struct xfrm_mark *mark, u32 if_id,
+ 					spin_unlock_bh(&net->xfrm.xfrm_policy_lock);
+ 					return pol;
+ 				}
++				xfrm_policy_change_begin(net);
+ 				__xfrm_policy_unlink(pol, dir);
+ 			}
+ 			ret = pol;
+ 			break;
+ 		}
+ 	}
++	if (ret && delete)
++		xfrm_policy_change_end(net);
+ 	spin_unlock_bh(&net->xfrm.xfrm_policy_lock);
+ 
+ 	if (ret && delete)
+@@ -1811,6 +1850,7 @@ static inline int xfrm_dev_policy_flush_secctx_check(struct net *net,
+ 
+ int xfrm_policy_flush(struct net *net, u8 type, bool task_valid)
+ {
++	bool changing = false;
+ 	int dir, err = 0, cnt = 0;
+ 	struct xfrm_policy *pol;
+ 
+@@ -1819,6 +1859,8 @@ int xfrm_policy_flush(struct net *net, u8 type, bool task_valid)
+ 	err = xfrm_policy_flush_secctx_check(net, type, task_valid);
+ 	if (err)
+ 		goto out;
++	xfrm_policy_change_begin(net);
++	changing = true;
+ 
+ again:
+ 	list_for_each_entry(pol, &net->xfrm.policy_all, walk.all) {
+@@ -1843,6 +1885,8 @@ int xfrm_policy_flush(struct net *net, u8 type, bool task_valid)
+ 	else
+ 		err = -ESRCH;
+ out:
++	if (changing)
++		xfrm_policy_change_end(net);
+ 	spin_unlock_bh(&net->xfrm.xfrm_policy_lock);
+ 	return err;
+ }
+@@ -1851,6 +1895,7 @@ EXPORT_SYMBOL(xfrm_policy_flush);
+ int xfrm_dev_policy_flush(struct net *net, struct net_device *dev,
+ 			  bool task_valid)
+ {
++	bool changing = false;
+ 	int dir, err = 0, cnt = 0;
+ 	struct xfrm_policy *pol;
+ 
+@@ -1859,6 +1904,8 @@ int xfrm_dev_policy_flush(struct net *net, struct net_device *dev,
+ 	err = xfrm_dev_policy_flush_secctx_check(net, dev, task_valid);
+ 	if (err)
+ 		goto out;
++	xfrm_policy_change_begin(net);
++	changing = true;
+ 
+ again:
+ 	list_for_each_entry(pol, &net->xfrm.policy_all, walk.all) {
+@@ -1883,6 +1930,8 @@ int xfrm_dev_policy_flush(struct net *net, struct net_device *dev,
+ 	else
+ 		err = -ESRCH;
+ out:
++	if (changing)
++		xfrm_policy_change_end(net);
+ 	spin_unlock_bh(&net->xfrm.xfrm_policy_lock);
+ 	return err;
+ }
+@@ -2322,6 +2371,9 @@ static void __xfrm_policy_link(struct xfrm_policy *pol, int dir)
+ 
+ 	list_add(&pol->walk.all, &net->xfrm.policy_all);
+ 	WRITE_ONCE(net->xfrm.policy_count[dir], net->xfrm.policy_count[dir] + 1);
++	if (dir < XFRM_POLICY_MAX &&
++	    (pol->mark.m || pol->if_id || pol->security))
++		atomic_inc(&net->xfrm.policy_flowtable_unsafe);
+ 	xfrm_pol_hold(pol);
+ }
+ 
+@@ -2341,6 +2393,9 @@ static struct xfrm_policy *__xfrm_policy_unlink(struct xfrm_policy *pol,
+ 
+ 	list_del_init(&pol->walk.all);
+ 	WRITE_ONCE(net->xfrm.policy_count[dir], net->xfrm.policy_count[dir] - 1);
++	if (dir < XFRM_POLICY_MAX &&
++	    (pol->mark.m || pol->if_id || pol->security))
++		atomic_dec(&net->xfrm.policy_flowtable_unsafe);
+ 
+ 	return pol;
+ }
+@@ -2358,9 +2413,16 @@ static void xfrm_sk_policy_unlink(struct xfrm_policy *pol, int dir)
+ int xfrm_policy_delete(struct xfrm_policy *pol, int dir)
+ {
+ 	struct net *net = xp_net(pol);
++	bool changing = false;
+ 
+ 	spin_lock_bh(&net->xfrm.xfrm_policy_lock);
++	if (dir < XFRM_POLICY_MAX && !list_empty(&pol->walk.all)) {
++		xfrm_policy_change_begin(net);
++		changing = true;
++	}
+ 	pol = __xfrm_policy_unlink(pol, dir);
++	if (changing)
++		xfrm_policy_change_end(net);
+ 	spin_unlock_bh(&net->xfrm.xfrm_policy_lock);
+ 	if (pol) {
+ 		xfrm_policy_kill(pol);
+@@ -3681,6 +3743,7 @@ int __xfrm_policy_check(struct sock *sk, int dir, struct sk_buff *skb,
+ 	int xerr_idx = -1;
+ 	const struct xfrm_if_cb *ifcb;
+ 	struct sec_path *sp;
++	u32 policy_genid;
+ 	u32 if_id = 0;
+ 
+ 	rcu_read_lock();
+@@ -3695,6 +3758,7 @@ int __xfrm_policy_check(struct sock *sk, int dir, struct sk_buff *skb,
+ 		}
+ 	}
+ 	rcu_read_unlock();
++	policy_genid = xfrm_policy_generation(net);
+ 
+ 	reverse = dir & ~XFRM_POLICY_MASK;
+ 	dir &= XFRM_POLICY_MASK;
+@@ -3795,6 +3859,7 @@ int __xfrm_policy_check(struct sock *sk, int dir, struct sk_buff *skb,
+ 		struct xfrm_tmpl *tp[XFRM_MAX_DEPTH];
+ 		struct xfrm_tmpl *stp[XFRM_MAX_DEPTH];
+ 		struct xfrm_tmpl **tpp = tp;
++		bool policy_flowtable = xfrm_policy_flowtable_eligible(net);
+ 		int i, k = 0;
+ 		int ti = 0;
+ 
+@@ -3855,7 +3920,22 @@ int __xfrm_policy_check(struct sock *sk, int dir, struct sk_buff *skb,
+ 
+ out:
+ 		xfrm_pols_put(pols, npols);
+-		sp->verified_cnt = k;
++		if (sp != &dummy) {
++			sp->verified_cnt = k;
++			if (policy_genid == xfrm_policy_generation(net)) {
++				if (sp->policy_checked &&
++				    (sp->policy_genid != policy_genid ||
++				     !sp->policy_flowtable))
++					policy_flowtable = false;
++				sp->policy_checked = 1;
++				sp->policy_flowtable = policy_flowtable;
++				sp->policy_genid = policy_genid;
++			} else {
++				sp->policy_checked = 1;
++				sp->policy_flowtable = 0;
++				sp->policy_genid = 0;
++			}
++		}
+ 
+ 		return 1;
+ 	}
+@@ -4314,6 +4394,9 @@ static int __net_init xfrm_net_init(struct net *net)
+ 	/* Initialize the per-net locks here */
+ 	spin_lock_init(&net->xfrm.xfrm_state_lock);
+ 	spin_lock_init(&net->xfrm.xfrm_policy_lock);
++	atomic_set(&net->xfrm.policy_genid, 1);
++	atomic_set(&net->xfrm.policy_change_count, 0);
++	atomic_set(&net->xfrm.policy_flowtable_unsafe, 0);
+ 	seqcount_spinlock_init(&net->xfrm.xfrm_policy_hash_generation, &net->xfrm.xfrm_policy_lock);
+ 	mutex_init(&net->xfrm.xfrm_cfg_mutex);
+ 	net->xfrm.policy_default[XFRM_POLICY_IN] = XFRM_USERPOLICY_ACCEPT;
+@@ -4563,15 +4646,21 @@ static int xfrm_policy_migrate(struct xfrm_policy *pol,
+ 			       struct xfrm_migrate *m, int num_migrate,
+ 			       struct netlink_ext_ack *extack)
+ {
++	struct net *net = xp_net(pol);
+ 	struct xfrm_migrate *mp;
++	int err = 0;
+ 	int i, j, n = 0;
+ 
++	spin_lock_bh(&net->xfrm.xfrm_policy_lock);
++	xfrm_policy_change_begin(net);
++	spin_unlock_bh(&net->xfrm.xfrm_policy_lock);
++
+ 	write_lock_bh(&pol->lock);
+ 	if (unlikely(pol->walk.dead)) {
+ 		/* target policy has been deleted */
+ 		NL_SET_ERR_MSG(extack, "Target policy not found");
+-		write_unlock_bh(&pol->lock);
+-		return -ENOENT;
++		err = -ENOENT;
++		goto unlock;
+ 	}
+ 
+ 	for (i = 0; i < pol->xfrm_nr; i++) {
+@@ -4594,12 +4683,16 @@ static int xfrm_policy_migrate(struct xfrm_policy *pol,
+ 		}
+ 	}
+ 
++	if (!n)
++		err = -ENODATA;
++unlock:
+ 	write_unlock_bh(&pol->lock);
+ 
+-	if (!n)
+-		return -ENODATA;
++	spin_lock_bh(&net->xfrm.xfrm_policy_lock);
++	xfrm_policy_change_end(net);
++	spin_unlock_bh(&net->xfrm.xfrm_policy_lock);
+ 
+-	return 0;
++	return err;
+ }
+ 
+ static int xfrm_migrate_check(const struct xfrm_migrate *m, int num_migrate,

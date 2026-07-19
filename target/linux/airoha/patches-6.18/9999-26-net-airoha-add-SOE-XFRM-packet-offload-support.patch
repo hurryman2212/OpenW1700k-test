@@ -1,0 +1,4017 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jihong Min <hurryman2212@gmail.com>
+Date: Tue, 4 Aug 2026 16:29:39 +0900
+Subject: [PATCH] net: airoha: add SOE XFRM packet offload support
+
+Implement EN7581 ESP and NAT-T packet offload with XFRM and PPE integration.
+
+Assisted-by: Codex:gpt-5.6
+Signed-off-by: Jihong Min <hurryman2212@gmail.com>
+---
+ drivers/net/ethernet/airoha/airoha_soe.c | 3997 ++++++++++++++++++++++
+ 1 file changed, 3997 insertions(+)
+ create mode 100644 drivers/net/ethernet/airoha/airoha_soe.c
+
+diff --git a/drivers/net/ethernet/airoha/airoha_soe.c b/drivers/net/ethernet/airoha/airoha_soe.c
+new file mode 100644
+index 0000000..4f78c4d
+--- /dev/null
++++ b/drivers/net/ethernet/airoha/airoha_soe.c
+@@ -0,0 +1,3997 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Airoha Secure Offload Engine (SOE) provider for the Ethernet driver.
++ *
++ * This file owns the EN7581 SOE packet-offload glue used by airoha_eth:
++ * xfrm state programming, hop-descriptor TX metadata, SOE RX completion
++ * decoding, and DSA proxy netdev binding. The SOE block is reached through
++ * the FE/QDMA packet fabric and is initialized by the Ethernet driver rather
++ * than by a separate platform driver.
++ *
++ * Copyright (c) 2026 AIROHA Inc
++ * Author: Jihong Min <hurryman2212@gmail.com>
++ */
++
++#include <linux/atomic.h>
++#include <linux/bitfield.h>
++#include <linux/bitmap.h>
++#include <linux/completion.h>
++#include <linux/device.h>
++#include <linux/err.h>
++#include <linux/if_ether.h>
++#include <linux/if_packet.h>
++#include <linux/interrupt.h>
++#include <linux/iopoll.h>
++#include <linux/io.h>
++#include <linux/ipv6.h>
++#include <linux/list.h>
++#include <linux/mutex.h>
++#include <linux/netdevice.h>
++#include <linux/of.h>
++#include <linux/of_address.h>
++#include <linux/of_irq.h>
++#include <linux/rcupdate.h>
++#include <linux/refcount.h>
++#include <linux/skbuff.h>
++#include <linux/slab.h>
++#include <linux/spinlock.h>
++#include <linux/string.h>
++#include <linux/udp.h>
++#include <linux/unaligned.h>
++#include <linux/workqueue.h>
++
++#include <net/dst.h>
++#include <net/esp.h>
++#include <net/gso.h>
++#include <net/ip.h>
++#include <net/net_namespace.h>
++#include <net/route.h>
++#include <net/sock.h>
++#include <net/xfrm.h>
++
++#include "airoha_eth.h"
++#include "airoha_regs.h"
++#include "airoha_soe.h"
++
++#define AIROHA_SOE_NUM_SA 32
++#define AIROHA_SOE_QDMA_HOP_DESC_LEN 32
++#define AIROHA_SOE_KEY_WORDS 8
++#define AIROHA_SOE_ADDR_WORDS 4
++#define AIROHA_SOE_SA_TIMEOUT_US 1000
++#define AIROHA_SOE_HOP_DESC0_ENCRYPT 0xffffff81ULL
++#define AIROHA_SOE_HOP_DESC0_DECRYPT 0xffffff82ULL
++#define AIROHA_SOE_HOP_DESC1 0x1ff00000000ULL
++#define AIROHA_SOE_TXMSG2_DEFAULT 0xff00ffff
++
++/* This is the packet/IPsec SOE window at 0x1fbfa000. EN7581 E2 exposes
++ * this register block for packet processing, not standalone crypto offload.
++ */
++#define AIROHA_SOE_GLB_CFG 0x000
++#define AIROHA_SOE_GLB_CFG_ENC_EN BIT(0)
++#define AIROHA_SOE_GLB_CFG_DEC_EN BIT(1)
++#define AIROHA_SOE_CONT_ICV_CTRL 0x004
++#define AIROHA_SOE_INT_EN 0x020
++#define AIROHA_SOE_INT_STS 0x024
++#define AIROHA_SOE_CONT_ICV_FAIL_STS 0x030
++#define AIROHA_SOE_SEQ_NUM_SOFT_STS 0x038
++#define AIROHA_SOE_BCNT_SOFT_STS 0x040
++#define AIROHA_SOE_SEQ_NUM_HARD_STS 0x0b0
++#define AIROHA_SOE_BCNT_HARD_STS 0x0b8
++#define AIROHA_SOE_DEC_ICV_ERR_STS 0x0c0
++#define AIROHA_SOE_DEC_SN_ERR_STS 0x0c8
++#define AIROHA_SOE_DEC_PAD_ERR_STS 0x0d0
++#define AIROHA_SOE_INT_CONT_ICV_FAIL BIT(0)
++#define AIROHA_SOE_INT_SEQ_NUM_HARD BIT(11)
++#define AIROHA_SOE_INT_DEC_ICV_ERR_DROP BIT(13)
++#define AIROHA_SOE_INT_DEC_SN_ERR_DROP BIT(14)
++#define AIROHA_SOE_INT_DEC_PAD_ERR_DROP BIT(15)
++#define AIROHA_SOE_INT_ENC_PACKET_ERROR GENMASK(5, 3)
++#define AIROHA_SOE_INT_DEC_PACKET_ERROR GENMASK(10, 6)
++#define AIROHA_SOE_INT_DEC_SA_ERROR \
++	(AIROHA_SOE_INT_DEC_ICV_ERR_DROP | \
++	 AIROHA_SOE_INT_DEC_SN_ERR_DROP | \
++	 AIROHA_SOE_INT_DEC_PAD_ERR_DROP)
++#define AIROHA_SOE_INT_PACKET_ERROR \
++	(AIROHA_SOE_INT_ENC_PACKET_ERROR | \
++	 AIROHA_SOE_INT_DEC_PACKET_ERROR | \
++	 AIROHA_SOE_INT_DEC_SA_ERROR)
++#define AIROHA_SOE_INT_ALL GENMASK(15, 0)
++#define AIROHA_SOE_SEQ_NUM_HARD_LIMIT 0xf0000000U
++#define AIROHA_SOE_CNT_CLR 0x04c
++#define AIROHA_SOE_CNT_CLR_ALL BIT(0)
++#define AIROHA_SOE_SA_CTRL 0x100
++#define AIROHA_SOE_SA_DONE 0x104
++#define AIROHA_SOE_SA_CMD 0x110
++#define AIROHA_SOE_BCNT_THSHD_32_SOFT 0x114
++#define AIROHA_SOE_BCNT_THSHD_64_SOFT 0x118
++#define AIROHA_SOE_SA_SPI 0x11c
++#define AIROHA_SOE_SA_UDP_PORT 0x120
++#define AIROHA_SOE_SA_UDP_PORT_SRC GENMASK(31, 16)
++#define AIROHA_SOE_SA_UDP_PORT_DST GENMASK(15, 0)
++#define AIROHA_SOE_SA_ENC_KEY(n) (0x124 + (n) * 4)
++#define AIROHA_SOE_SA_HMAC_KEY(n) (0x144 + (n) * 4)
++#define AIROHA_SOE_SA_SRC_ADDR(n) (0x164 + (n) * 4)
++#define AIROHA_SOE_SA_DST_ADDR(n) (0x174 + (n) * 4)
++#define AIROHA_SOE_ICV_OK_LO_CNT 0x184
++#define AIROHA_SOE_ICV_OK_HI_CNT 0x188
++#define AIROHA_SOE_ICV_FAIL_LO_CNT 0x18c
++#define AIROHA_SOE_ICV_FAIL_HI_CNT 0x190
++#define AIROHA_SOE_CON_ICV_FAIL_CNT 0x194
++#define AIROHA_SOE_SEQ_NUM_LO 0x198
++#define AIROHA_SOE_SEQ_NUM_HI 0x19c
++#define AIROHA_SOE_BCNT_LO 0x1a0
++#define AIROHA_SOE_BCNT_HI 0x1a4
++#define AIROHA_SOE_FLOW_LAB_DSCP 0x1a8
++#define AIROHA_SOE_BCNT_80 0x1ac
++#define AIROHA_SOE_BCNT_THSHD_80 0x1b0
++#define AIROHA_SOE_BCNT_THSHD_32_HARD 0x1b4
++#define AIROHA_SOE_BCNT_THSHD_64_HARD 0x1b8
++#define AIROHA_SOE_SEQ_THSHD_32_SOFT 0x1bc
++#define AIROHA_SOE_SEQ_THSHD_64_SOFT 0x1c0
++#define AIROHA_SOE_SEQ_THSHD_32_HARD 0x1c4
++#define AIROHA_SOE_SEQ_THSHD_64_HARD 0x1c8
++#define AIROHA_SOE_SA_CTRL_WR BIT(0)
++#define AIROHA_SOE_SA_CTRL_IDX GENMASK(15, 8)
++#define AIROHA_SOE_SA_DONE_W1C BIT(0)
++
++#define AIROHA_SOE_SA_CMD_ENC BIT(0)
++#define AIROHA_SOE_SA_CMD_CIPHER GENMASK(3, 1)
++#define AIROHA_SOE_SA_CMD_HASH GENMASK(6, 4)
++#define AIROHA_SOE_SA_CMD_AES_KEY_LEN GENMASK(8, 7)
++#define AIROHA_SOE_SA_CMD_ESN_EN BIT(9)
++#define AIROHA_SOE_SA_CMD_OUT_IPV6 BIT(10)
++#define AIROHA_SOE_SA_CMD_ESP_MODE BIT(11) /* 0=tunnel, 1=transport */
++#define AIROHA_SOE_SA_CMD_NAT_EN BIT(12)
++#define AIROHA_SOE_SA_CMD_ANTI_RPLY_EN BIT(13)
++#define AIROHA_SOE_SA_CMD_ANTI_RPLY_WDW GENMASK(15, 14)
++#define AIROHA_SOE_SA_CMD_SN_ERR_DROP BIT(16)
++#define AIROHA_SOE_SA_CMD_PAD_ERR_DROP BIT(17)
++#define AIROHA_SOE_SA_CMD_ICV_ERR_DROP BIT(18)
++#define AIROHA_SOE_SA_CMD_DF_CFG_EN BIT(19)
++#define AIROHA_SOE_SA_CMD_IN_DSCP_CP_OUT_EN BIT(23)
++#define AIROHA_SOE_SA_CMD_GCM_ICV_LEN GENMASK(25, 24)
++#define AIROHA_SOE_SA_CMD_OUT_DSCP_CFG_EN BIT(27)
++#define AIROHA_SOE_SA_CMD_ECN_MODE BIT(28)
++#define AIROHA_SOE_SA_CMD_DEC_UDP_PARSER_EN BIT(29)
++#define AIROHA_SOE_SA_CMD_VLD BIT(31)
++
++#define AIROHA_SOE_CIPHER_AES_CBC 1
++#define AIROHA_SOE_CIPHER_AES_GCM 2
++#define AIROHA_SOE_HASH_HMAC_SHA1_96 1
++#define AIROHA_SOE_HASH_HMAC_SHA256_128 2
++#define AIROHA_SOE_AES_KEY_128 0
++#define AIROHA_SOE_AES_KEY_192 1
++#define AIROHA_SOE_AES_KEY_256 2
++#define AIROHA_SOE_QDMA_QUEUE_ENCRYPT 8
++#define AIROHA_SOE_QDMA_QUEUE_DECRYPT 9
++#define AIROHA_SOE_HOP_FLAG_ENCRYPTED 3
++#define AIROHA_SOE_HOP_FLAG_DECRYPTED 4
++#define AIROHA_SOE_HOP_INFO_ENCRYPT 2
++#define AIROHA_SOE_HOP_INFO_DECRYPT 3
++#define AIROHA_SOE_COMPLETION_SA_MASK GENMASK(4, 0)
++#define AIROHA_SOE_COMPLETION_SEQ_MASK GENMASK(7, 5)
++#define AIROHA_SOE_COMPLETION_SEQ_UNTRACKED 7
++#define AIROHA_SOE_COMPLETION_SEQ_COUNT 7
++#define AIROHA_SOE_BIND_TX_MAX 1024
++#define AIROHA_SOE_NATT_PORT 4500
++
++static const u8 airoha_soe_ipv4_l2_header[ETH_HLEN] = {
++	0x00, 0x0c, 0xe7, 0x20, 0x21, 0x12, 0x00,
++	0x0c, 0xe7, 0x20, 0x22, 0x62, 0x08, 0x00,
++};
++
++static const u8 airoha_soe_ipv6_l2_header[ETH_HLEN] = {
++	0x00, 0x0c, 0xe7, 0x20, 0x21, 0x12, 0x00,
++	0x0c, 0xe7, 0x20, 0x22, 0x62, 0x86, 0xdd,
++};
++
++enum airoha_soe_ctx_dir {
++	AIROHA_SOE_CTX_OUT,
++	AIROHA_SOE_CTX_IN,
++};
++
++struct airoha_soe_ctx {
++	struct list_head list;
++	struct sk_buff *metadata;
++	enum airoha_soe_ctx_dir dir;
++	u8 completion_tag;
++	union {
++		struct {
++			struct dst_entry *dst;
++			struct sock *sk;
++			struct sk_buff *deferred_skb;
++			struct airoha_soe_sa *deferred_sa;
++			struct airoha_gdm_dev *deferred_dev;
++			struct xfrm_state *deferred_x;
++			struct airoha_soe_ppe_flow_key ppe_key;
++			u32 tskey;
++			u8 tx_flags;
++			bool ppe_key_valid;
++		} tx;
++		struct {
++			struct xfrm_state *x;
++			struct net_device *dev;
++			__be32 saddr;
++			__be16 sport;
++			__be32 seq;
++			u16 foe_hash;
++			bool foe_valid;
++		} rx;
++	};
++};
++
++struct airoha_soe_ppe_key {
++	__be32 saddr;
++	__be32 daddr;
++	__be16 sport;
++	__be16 dport;
++	bool encap;
++};
++
++struct airoha_soe_sa {
++	struct airoha_soe *soe;
++	struct xfrm_state *x;
++	unsigned int index;
++	u32 cmd;
++
++	spinlock_t lock; /* Protects in-flight context queues and dead. */
++	struct list_head tx_queue;
++	struct list_head rx_queue;
++	struct list_head ppe_flows;
++	struct completion idle;
++	unsigned int inflight;
++	unsigned long completion_seq_map;
++	struct airoha_soe_ppe_key ppe_key;
++	bool hw_cleared;
++	bool quarantined;
++	bool dead;
++	bool ppe_conflict;
++	bool ppe_disabled;
++};
++
++struct airoha_soe_xfrm_state {
++	struct airoha_gdm_dev *dev;
++	struct net_device *netdev;
++	struct airoha_soe *soe;
++	struct airoha_soe_sa *sa;
++	struct work_struct flush_work;
++	struct work_struct ppe_flush_work;
++	bool counted;
++	bool ppe_quiesced;
++	bool ppe_flush_quiesced;
++};
++
++struct airoha_soe_sa_cfg {
++	u32 cmd;
++	u32 spi;
++	u32 udp_port;
++	u32 enc_key[AIROHA_SOE_KEY_WORDS];
++	u32 hmac_key[AIROHA_SOE_KEY_WORDS];
++	u32 src_addr[AIROHA_SOE_ADDR_WORDS];
++	u32 dst_addr[AIROHA_SOE_ADDR_WORDS];
++	u64 soft_byte_limit;
++	u64 hard_byte_limit;
++	u64 soft_packet_limit;
++	u64 hard_packet_limit;
++};
++
++struct airoha_soe_rx_info {
++	int packet_len;
++	bool encap;
++	__be32 saddr;
++	__be32 daddr;
++	__be16 sport;
++	__be16 dport;
++	__be32 spi;
++	__be32 seq;
++};
++
++struct airoha_soe {
++	struct airoha_eth *eth;
++	struct device *dev;
++	void __iomem *base;
++	int irq;
++	struct list_head list;
++	struct notifier_block netdev_nb;
++	struct work_struct fault_work;
++	struct work_struct error_work;
++	struct work_struct seq_work;
++	struct work_struct policy_work;
++	struct work_struct bind_tx_work;
++	struct list_head ppe_flows;
++	struct list_head bind_tx_queue;
++
++	/* Serialize SA table programming and software slot ownership. */
++	struct mutex sa_lock;
++	unsigned long sa_map;
++	struct airoha_soe_sa __rcu *sa[AIROHA_SOE_NUM_SA];
++	atomic_t error_pending;
++	atomic_t error_sa_pending;
++	atomic_t seq_pending;
++	atomic_t queued_ctx;
++	atomic_t active_ctx;
++
++	spinlock_t state_lock; /* Protects dead against concurrent users. */
++	/* Protects CPU submission, PPE binding and sequence quiesce/restart. */
++	spinlock_t seq_lock;
++	spinlock_t policy_lock; /* Protects policy generation and quiesce. */
++	refcount_t refcnt;
++	struct completion released;
++	bool faulted;
++	bool dead;
++	u32 policy_generation;
++	unsigned int policy_change_count;
++	bool ppe_quiesced;
++	bool policy_quiesced;
++	bool seq_ppe_quiesced;
++	bool seq_stopped;
++	u64 ppe_bind_generation;
++	u64 ppe_bind_drained_generation;
++	unsigned int ppe_bind_pending;
++	unsigned int bind_tx_queued;
++	bool ppe_bind_active;
++	bool bind_tx_draining;
++};
++
++static LIST_HEAD(airoha_soe_list);
++static DEFINE_MUTEX(airoha_soe_list_lock);
++static unsigned int airoha_soe_list_users;
++
++static const struct xfrmdev_ops airoha_soe_xfrmdev_ops;
++static const struct xfrmdev_ops airoha_soe_dsa_xfrmdev_ops;
++static void airoha_soe_detach_queued_ctx(struct airoha_soe_sa *sa,
++					 struct list_head *tx_queue,
++					 struct list_head *rx_queue);
++static void airoha_soe_purge_ctx_list(struct list_head *head);
++static void airoha_soe_purge_bind_tx(struct airoha_soe *soe,
++				     struct airoha_soe_sa *sa);
++
++static struct airoha_soe *airoha_soe_get_ref(struct airoha_soe *soe)
++{
++	unsigned long flags;
++	bool alive;
++
++	if (!soe)
++		return NULL;
++
++	spin_lock_irqsave(&soe->state_lock, flags);
++	alive = !soe->dead && refcount_inc_not_zero(&soe->refcnt);
++	spin_unlock_irqrestore(&soe->state_lock, flags);
++
++	return alive ? soe : NULL;
++}
++
++static void airoha_soe_put_ref(struct airoha_soe *soe)
++{
++	if (soe && refcount_dec_and_test(&soe->refcnt))
++		complete(&soe->released);
++}
++
++bool airoha_soe_available(struct airoha_soe *soe)
++{
++	unsigned long flags;
++	bool available;
++
++	if (!soe)
++		return false;
++
++	spin_lock_irqsave(&soe->state_lock, flags);
++	available = !soe->dead;
++	spin_unlock_irqrestore(&soe->state_lock, flags);
++
++	return available;
++}
++
++void airoha_soe_ppe_adopt_quiesce(struct airoha_soe *soe, bool quiesced)
++{
++	unsigned long flags;
++	bool adopted = false;
++
++	if (!quiesced)
++		return;
++
++	spin_lock_irqsave(&soe->state_lock, flags);
++	if (!soe->ppe_quiesced) {
++		soe->ppe_quiesced = true;
++		adopted = true;
++	}
++	spin_unlock_irqrestore(&soe->state_lock, flags);
++
++	if (!adopted)
++		airoha_ppe_soe_resume(soe->eth);
++}
++
++static void airoha_soe_ppe_quiesce_persistent(struct airoha_soe *soe)
++{
++	bool quiesced;
++
++	quiesced = airoha_ppe_soe_quiesce(soe->eth);
++	airoha_soe_ppe_adopt_quiesce(soe, quiesced);
++}
++
++static bool airoha_soe_ppe_available(struct airoha_soe *soe)
++{
++	unsigned long flags;
++	bool available;
++
++	spin_lock_irqsave(&soe->state_lock, flags);
++	available = !soe->dead && !soe->ppe_quiesced;
++	spin_unlock_irqrestore(&soe->state_lock, flags);
++	if (!available)
++		return false;
++
++	spin_lock_irqsave(&soe->policy_lock, flags);
++	available = !soe->policy_quiesced;
++	spin_unlock_irqrestore(&soe->policy_lock, flags);
++	if (!available)
++		return false;
++
++	return !airoha_ppe_soe_is_quiesced(soe->eth);
++}
++
++u32 airoha_soe_features(struct airoha_soe *soe)
++{
++	return airoha_soe_available(soe) ? AIROHA_SOE_FEATURE_ESP : 0;
++}
++
++static void airoha_soe_mark_sa_dead(struct airoha_soe_sa *sa)
++{
++	if (!sa)
++		return;
++
++	spin_lock_bh(&sa->lock);
++	sa->dead = true;
++	if (!sa->inflight)
++		complete(&sa->idle);
++	spin_unlock_bh(&sa->lock);
++	airoha_soe_purge_bind_tx(sa->soe, sa);
++}
++
++int airoha_soe_ppe_flow_add(struct airoha_soe *soe, struct xfrm_state *x,
++			    u8 dir, struct airoha_soe_ppe_flow *flow,
++			    struct airoha_soe_ppe_info *info)
++{
++	const struct xfrmdev_ops *ops;
++	struct airoha_soe_xfrm_state *state;
++	struct airoha_soe_sa *sa;
++	int err = -EOPNOTSUPP;
++
++	if (!soe || !x || !flow || !info || flow->soe || flow->sa ||
++	    !list_empty(&flow->sa_node) || !list_empty(&flow->soe_node))
++		return -EINVAL;
++	if (!airoha_soe_ppe_available(soe))
++		return -ENODEV;
++	if (!xfrm_dev_offload_get(x))
++		return -ENOENT;
++
++	spin_lock_bh(&x->lock);
++	ops = READ_ONCE(x->xso.state_ops);
++	if (x->km.state != XFRM_STATE_VALID ||
++	    (ops != &airoha_soe_xfrmdev_ops &&
++	     ops != &airoha_soe_dsa_xfrmdev_ops) ||
++	    x->xso.type != XFRM_DEV_OFFLOAD_PACKET || x->xso.dir != dir ||
++	    x->mark.v || x->mark.m || x->props.smark.v ||
++	    x->props.smark.m || x->if_id || x->security || x->coaddr ||
++	    x->tunnel)
++		goto unlock_state;
++
++	state = (struct airoha_soe_xfrm_state *)x->xso.offload_handle;
++	if (!state || state->soe != soe || !state->sa)
++		goto unlock_state;
++
++	sa = state->sa;
++	spin_unlock_bh(&x->lock);
++
++	spin_lock_bh(&sa->lock);
++	if (sa->dead || sa->ppe_conflict || sa->ppe_disabled ||
++	    state->sa != sa || sa->soe != soe ||
++	    (dir == XFRM_DEV_OFFLOAD_IN && sa->ppe_key.encap &&
++	     (!soe->eth->natt_ifc_ready ||
++	      sa->ppe_key.dport != htons(AIROHA_SOE_NATT_PORT)))) {
++		err = -ENOENT;
++	} else {
++		info->saddr = sa->ppe_key.saddr;
++		info->daddr = sa->ppe_key.daddr;
++		info->spi = x->id.spi;
++		info->sport = sa->ppe_key.sport;
++		info->dport = sa->ppe_key.dport;
++		info->encap = sa->ppe_key.encap;
++		flow->soe = soe;
++		flow->sa = sa;
++		flow->input = dir == XFRM_DEV_OFFLOAD_IN;
++		list_add_tail(&flow->sa_node, &sa->ppe_flows);
++		list_add_tail(&flow->soe_node, &soe->ppe_flows);
++		info->sa_index = sa->index;
++		info->hop = dir == XFRM_DEV_OFFLOAD_OUT ?
++			AIROHA_SOE_HOP_INFO_ENCRYPT : AIROHA_SOE_HOP_INFO_DECRYPT;
++		err = 0;
++	}
++	spin_unlock_bh(&sa->lock);
++	goto out;
++
++unlock_state:
++	spin_unlock_bh(&x->lock);
++out:
++	xfrm_dev_offload_put(x);
++
++	return err;
++}
++
++void airoha_soe_ppe_flow_del(struct airoha_soe_ppe_flow *flow)
++{
++	struct airoha_soe_sa *sa;
++	struct airoha_soe *soe;
++
++	if (!flow)
++		return;
++
++	sa = flow->sa;
++	soe = flow->soe;
++	if (!sa || !soe)
++		return;
++
++	airoha_ppe_soe_bind_cancel(soe->eth, flow);
++	airoha_soe_ppe_flow_unbind(flow);
++	spin_lock_bh(&sa->lock);
++	if (flow->sa == sa && flow->soe == sa->soe) {
++		list_del_init(&flow->sa_node);
++		list_del_init(&flow->soe_node);
++		flow->soe = NULL;
++		flow->sa = NULL;
++	}
++	spin_unlock_bh(&sa->lock);
++}
++
++bool airoha_soe_ppe_flow_bind_start(struct airoha_soe_ppe_flow *flow,
++				    bool *ready)
++{
++	struct airoha_soe_sa *sa;
++	struct airoha_soe *soe;
++	unsigned long flags;
++	bool started = false;
++
++	if (!flow || !flow->sa || !flow->soe || !ready)
++		return false;
++
++	*ready = false;
++	sa = flow->sa;
++	soe = flow->soe;
++	spin_lock_irqsave(&soe->seq_lock, flags);
++	spin_lock(&sa->lock);
++	if (flow->sa == sa && flow->soe == soe && sa->soe == soe && !sa->dead &&
++	    !flow->bound) {
++		if (!flow->bind_preparing) {
++			if (!soe->ppe_bind_active) {
++				soe->ppe_bind_generation++;
++				soe->ppe_bind_active = true;
++			}
++			flow->bind_generation = soe->ppe_bind_generation;
++			flow->bind_preparing = true;
++			soe->ppe_bind_pending++;
++		}
++		if (!atomic_read(&soe->active_ctx)) {
++			soe->ppe_bind_drained_generation =
++				flow->bind_generation;
++		}
++		*ready = flow->bind_generation <=
++			 soe->ppe_bind_drained_generation;
++		started = true;
++	}
++	spin_unlock(&sa->lock);
++	spin_unlock_irqrestore(&soe->seq_lock, flags);
++
++	return started;
++}
++
++bool airoha_soe_ppe_flow_bind_ready(struct airoha_soe_ppe_flow *flow)
++{
++	struct airoha_soe_sa *sa;
++	struct airoha_soe *soe;
++	unsigned long flags;
++	bool ready = false;
++
++	if (!flow || !flow->sa || !flow->soe)
++		return false;
++
++	sa = flow->sa;
++	soe = flow->soe;
++	spin_lock_irqsave(&soe->seq_lock, flags);
++	spin_lock(&sa->lock);
++	ready = flow->sa == sa && flow->soe == soe && sa->soe == soe &&
++		!sa->dead && !flow->bound && flow->bind_preparing &&
++		flow->bind_generation <= soe->ppe_bind_drained_generation;
++	spin_unlock(&sa->lock);
++	spin_unlock_irqrestore(&soe->seq_lock, flags);
++
++	return ready;
++}
++
++static bool airoha_soe_ppe_bind_end_locked(struct airoha_soe *soe)
++{
++	bool flush_tx;
++
++	lockdep_assert_held(&soe->seq_lock);
++
++	if (WARN_ON_ONCE(!soe->ppe_bind_pending)) {
++		soe->ppe_bind_active = false;
++		flush_tx = !list_empty(&soe->bind_tx_queue);
++		soe->bind_tx_draining = flush_tx;
++		return flush_tx;
++	}
++	if (--soe->ppe_bind_pending)
++		return false;
++
++	soe->ppe_bind_active = false;
++	flush_tx = !list_empty(&soe->bind_tx_queue);
++	soe->bind_tx_draining = flush_tx;
++
++	return flush_tx;
++}
++
++bool airoha_soe_ppe_flow_bind_finish(struct airoha_soe_ppe_flow *flow)
++{
++	struct airoha_soe_sa *sa;
++	struct airoha_soe *soe;
++	unsigned long flags;
++	bool flush_tx = false;
++	bool bound = false;
++
++	if (!flow || !flow->sa || !flow->soe)
++		return false;
++
++	sa = flow->sa;
++	soe = flow->soe;
++	spin_lock_irqsave(&soe->seq_lock, flags);
++	spin_lock(&sa->lock);
++	if (flow->sa == sa && flow->soe == soe && sa->soe == soe && !sa->dead &&
++	    !flow->bound && flow->bind_preparing &&
++	    flow->bind_generation <= soe->ppe_bind_drained_generation) {
++		flow->bind_preparing = false;
++		flow->bound = true;
++		flush_tx = airoha_soe_ppe_bind_end_locked(soe);
++		bound = true;
++	}
++	spin_unlock(&sa->lock);
++	spin_unlock_irqrestore(&soe->seq_lock, flags);
++	if (flush_tx)
++		schedule_work(&soe->bind_tx_work);
++
++	return bound;
++}
++
++bool airoha_soe_ppe_flow_bind_share(struct airoha_soe_ppe_flow *flow,
++				    const struct airoha_soe_ppe_flow *source)
++{
++	struct airoha_soe_sa *sa;
++	struct airoha_soe *soe;
++	unsigned long flags;
++	bool bound = false;
++
++	if (!flow || !source || !flow->sa || !flow->soe)
++		return false;
++
++	sa = flow->sa;
++	soe = flow->soe;
++	spin_lock_irqsave(&soe->seq_lock, flags);
++	spin_lock(&sa->lock);
++	if (flow->sa == sa && flow->soe == soe && sa->soe == soe &&
++	    source->sa == sa && source->soe == soe && source->input &&
++	    source->bound && !source->bind_preparing && flow->input &&
++	    !flow->bound && !flow->bind_preparing && !sa->dead) {
++		flow->bound = true;
++		bound = true;
++	}
++	spin_unlock(&sa->lock);
++	spin_unlock_irqrestore(&soe->seq_lock, flags);
++
++	return bound;
++}
++
++bool airoha_soe_ppe_flow_bind_clone(struct airoha_soe_ppe_flow *flow,
++				    const struct airoha_soe_ppe_flow *source)
++{
++	struct airoha_soe_sa *sa;
++	struct airoha_soe *soe;
++	unsigned long flags;
++	bool bound = false;
++
++	if (!flow || !source || flow->sa || flow->soe ||
++	    !list_empty(&flow->sa_node) || !list_empty(&flow->soe_node))
++		return false;
++
++	sa = source->sa;
++	soe = source->soe;
++	if (!sa || !soe)
++		return false;
++
++	spin_lock_irqsave(&soe->seq_lock, flags);
++	spin_lock(&sa->lock);
++	if (source->sa == sa && source->soe == soe && sa->soe == soe &&
++	    source->input && source->bound && !source->bind_preparing &&
++	    !sa->dead) {
++		flow->soe = soe;
++		flow->sa = sa;
++		flow->input = true;
++		flow->bound = true;
++		list_add_tail(&flow->sa_node, &sa->ppe_flows);
++		list_add_tail(&flow->soe_node, &soe->ppe_flows);
++		bound = true;
++	}
++	spin_unlock(&sa->lock);
++	spin_unlock_irqrestore(&soe->seq_lock, flags);
++
++	return bound;
++}
++
++void airoha_soe_ppe_flow_bind_abort(struct airoha_soe_ppe_flow *flow)
++{
++	struct airoha_soe_sa *sa;
++	struct airoha_soe *soe;
++	unsigned long flags;
++	bool flush_tx = false;
++
++	if (!flow || !flow->sa || !flow->soe)
++		return;
++
++	sa = flow->sa;
++	soe = flow->soe;
++	spin_lock_irqsave(&soe->seq_lock, flags);
++	spin_lock(&sa->lock);
++	if (flow->sa == sa && flow->soe == soe && sa->soe == soe &&
++	    flow->bind_preparing) {
++		flow->bind_preparing = false;
++		flush_tx = airoha_soe_ppe_bind_end_locked(soe);
++	}
++	spin_unlock(&sa->lock);
++	spin_unlock_irqrestore(&soe->seq_lock, flags);
++	if (flush_tx)
++		schedule_work(&soe->bind_tx_work);
++}
++
++void airoha_soe_ppe_flow_unbind(struct airoha_soe_ppe_flow *flow)
++{
++	struct airoha_soe_sa *sa;
++	struct airoha_soe *soe;
++	unsigned long flags;
++
++	if (!flow || !flow->sa || !flow->soe)
++		return;
++
++	sa = flow->sa;
++	soe = flow->soe;
++	spin_lock_irqsave(&soe->seq_lock, flags);
++	spin_lock(&sa->lock);
++	if (flow->sa == sa && flow->soe == soe && sa->soe == soe && flow->bound)
++		flow->bound = false;
++	spin_unlock(&sa->lock);
++	spin_unlock_irqrestore(&soe->seq_lock, flags);
++}
++
++static void airoha_soe_active_ctx_sub(struct airoha_soe *soe,
++				      unsigned int count)
++{
++	unsigned long flags;
++	int active;
++	bool tx_ready = false;
++	bool bind_ready = false;
++
++	active = atomic_sub_return(count, &soe->active_ctx);
++	if (WARN_ON_ONCE(active < 0)) {
++		atomic_set(&soe->active_ctx, 0);
++		active = 0;
++	}
++	spin_lock_irqsave(&soe->seq_lock, flags);
++	if (!active && soe->ppe_bind_active) {
++		soe->ppe_bind_drained_generation = soe->ppe_bind_generation;
++		bind_ready = true;
++	}
++	if (!soe->ppe_bind_active && !list_empty(&soe->bind_tx_queue)) {
++		soe->bind_tx_draining = true;
++		tx_ready = true;
++	}
++	spin_unlock_irqrestore(&soe->seq_lock, flags);
++
++	if (bind_ready)
++		airoha_ppe_soe_bind_ready(soe->eth);
++	if (tx_ready)
++		schedule_work(&soe->bind_tx_work);
++}
++
++static bool airoha_soe_ppe_bind_is_active(struct airoha_soe *soe)
++{
++	unsigned long flags;
++	bool active;
++
++	spin_lock_irqsave(&soe->seq_lock, flags);
++	active = soe->ppe_bind_active;
++	spin_unlock_irqrestore(&soe->seq_lock, flags);
++
++	return active;
++}
++
++void airoha_soe_ppe_flow_restore(struct airoha_soe_ppe_flow *flow)
++{
++	struct airoha_soe_sa *sa;
++
++	if (!flow || !flow->sa || !flow->soe)
++		return;
++
++	sa = flow->sa;
++	spin_lock_bh(&sa->lock);
++	if (flow->sa == sa && flow->soe == sa->soe &&
++	    list_empty(&flow->sa_node) && list_empty(&flow->soe_node)) {
++		list_add_tail(&flow->sa_node, &sa->ppe_flows);
++		list_add_tail(&flow->soe_node, &flow->soe->ppe_flows);
++	}
++	spin_unlock_bh(&sa->lock);
++}
++
++struct airoha_soe_ppe_flow *
++airoha_soe_ppe_flow_pop_sa(struct airoha_soe_sa *sa)
++{
++	struct airoha_soe_ppe_flow *flow = NULL;
++
++	if (!sa)
++		return NULL;
++
++	spin_lock_bh(&sa->lock);
++	if (!list_empty(&sa->ppe_flows)) {
++		flow = list_first_entry(&sa->ppe_flows,
++					struct airoha_soe_ppe_flow, sa_node);
++		list_del_init(&flow->sa_node);
++		list_del_init(&flow->soe_node);
++	}
++	spin_unlock_bh(&sa->lock);
++
++	return flow;
++}
++
++struct airoha_soe_ppe_flow *
++airoha_soe_ppe_flow_pop_all(struct airoha_soe *soe)
++{
++	struct airoha_soe_ppe_flow *flow;
++	struct airoha_soe_sa *sa;
++
++	if (!soe || list_empty(&soe->ppe_flows))
++		return NULL;
++
++	flow = list_first_entry(&soe->ppe_flows,
++				struct airoha_soe_ppe_flow, soe_node);
++	sa = flow->sa;
++	if (WARN_ON_ONCE(!sa))
++		return NULL;
++
++	spin_lock_bh(&sa->lock);
++	if (flow->soe != soe || flow->sa != sa) {
++		flow = NULL;
++	} else {
++		list_del_init(&flow->sa_node);
++		list_del_init(&flow->soe_node);
++	}
++	spin_unlock_bh(&sa->lock);
++
++	return flow;
++}
++
++static bool airoha_soe_mark_faulted(struct airoha_soe *soe)
++{
++	unsigned long flags;
++	bool first;
++
++	spin_lock_irqsave(&soe->state_lock, flags);
++	first = !soe->faulted;
++	soe->faulted = true;
++	soe->dead = true;
++	spin_unlock_irqrestore(&soe->state_lock, flags);
++
++	return first;
++}
++
++static void airoha_soe_disable_hw(struct airoha_soe *soe)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&soe->seq_lock, flags);
++	soe->seq_stopped = true;
++	writel(0, soe->base + AIROHA_SOE_INT_EN);
++	writel(0, soe->base + AIROHA_SOE_GLB_CFG);
++	readl(soe->base + AIROHA_SOE_GLB_CFG);
++	spin_unlock_irqrestore(&soe->seq_lock, flags);
++}
++
++static bool airoha_soe_fault_locked(struct airoha_soe *soe)
++{
++	unsigned int i;
++	bool first;
++
++	first = airoha_soe_mark_faulted(soe);
++	airoha_soe_disable_hw(soe);
++	for (i = 0; i < AIROHA_SOE_NUM_SA; i++)
++		airoha_soe_mark_sa_dead(rcu_access_pointer(soe->sa[i]));
++	if (first)
++		schedule_work(&soe->fault_work);
++
++	return first;
++}
++
++static void airoha_soe_fault_work(struct work_struct *work)
++{
++	struct airoha_soe *soe =
++		container_of(work, struct airoha_soe, fault_work);
++	LIST_HEAD(rx_queue);
++	LIST_HEAD(tx_queue);
++	unsigned int i;
++
++	airoha_soe_ppe_quiesce_persistent(soe);
++
++	mutex_lock(&soe->sa_lock);
++	airoha_soe_fault_locked(soe);
++	for (i = 0; i < AIROHA_SOE_NUM_SA; i++) {
++		struct airoha_soe_sa *sa = rcu_access_pointer(soe->sa[i]);
++
++		if (sa) {
++			airoha_ppe_soe_flush_sa(soe->eth, sa);
++			airoha_soe_detach_queued_ctx(sa, &tx_queue, &rx_queue);
++		}
++	}
++	mutex_unlock(&soe->sa_lock);
++
++	airoha_soe_purge_ctx_list(&tx_queue);
++	airoha_soe_purge_ctx_list(&rx_queue);
++}
++
++static bool airoha_soe_sa_has_queued_ctx(struct airoha_soe_sa *sa,
++					 enum airoha_soe_ctx_dir dir)
++{
++	struct list_head *head = dir == AIROHA_SOE_CTX_OUT ? &sa->tx_queue :
++								 &sa->rx_queue;
++	bool queued;
++
++	spin_lock_bh(&sa->lock);
++	queued = !list_empty(head);
++	spin_unlock_bh(&sa->lock);
++
++	return queued;
++}
++
++static void
++airoha_soe_fault_ambiguous_completion(struct airoha_soe *soe,
++				      struct airoha_soe_sa *sa,
++				      enum airoha_soe_ctx_dir dir)
++{
++	if (!airoha_soe_sa_has_queued_ctx(sa, dir) ||
++	    !airoha_soe_mark_faulted(soe))
++		return;
++
++	airoha_soe_disable_hw(soe);
++	dev_err_ratelimited(soe->dev,
++			    "SOE completion cannot be matched to a queued request; disabling provider\n");
++	schedule_work(&soe->fault_work);
++}
++
++static void airoha_soe_error_work(struct work_struct *work)
++{
++	struct airoha_soe *soe =
++		container_of(work, struct airoha_soe, error_work);
++	u32 sa_pending = atomic_xchg(&soe->error_sa_pending, 0);
++	u32 pending = atomic_xchg(&soe->error_pending, 0);
++	bool queued = false;
++	unsigned int i;
++
++	/* Error interrupts have no CPU-submission cookie. If an error can
++	 * overlap a queued request, continuing would leave that request pending
++	 * indefinitely. Stop the provider and discard the ambiguous queue.
++	 */
++	rcu_read_lock();
++	for (i = 0; i < AIROHA_SOE_NUM_SA && !queued; i++) {
++		struct airoha_soe_sa *sa = rcu_dereference(soe->sa[i]);
++
++		if (!sa)
++			continue;
++		if ((sa_pending & BIT(i)) ||
++		    (pending & AIROHA_SOE_INT_DEC_PACKET_ERROR) ||
++		    ((pending & AIROHA_SOE_INT_DEC_SA_ERROR) && !sa_pending))
++			queued = airoha_soe_sa_has_queued_ctx(sa,
++							      AIROHA_SOE_CTX_IN);
++		if (!queued && (pending & AIROHA_SOE_INT_ENC_PACKET_ERROR))
++			queued = airoha_soe_sa_has_queued_ctx(sa,
++							      AIROHA_SOE_CTX_OUT);
++	}
++	rcu_read_unlock();
++
++	if (queued && airoha_soe_mark_faulted(soe)) {
++		airoha_soe_disable_hw(soe);
++		dev_err_ratelimited(soe->dev,
++				    "SOE packet error overlapped a queued request; disabling provider\n");
++		schedule_work(&soe->fault_work);
++	}
++}
++
++static int airoha_soe_expire_sa(struct airoha_soe *soe, unsigned int index)
++{
++	struct xfrm_state *x = NULL;
++	struct airoha_soe_sa *sa;
++	int err;
++
++	rcu_read_lock();
++	sa = rcu_dereference(soe->sa[index]);
++	if (sa) {
++		x = READ_ONCE(sa->x);
++		if (x && !xfrm_dev_offload_get(x))
++			x = NULL;
++	}
++	rcu_read_unlock();
++	if (!x)
++		return 0;
++
++	airoha_soe_mark_sa_dead(sa);
++	err = airoha_ppe_soe_flush_sa(soe->eth, sa);
++	xfrm_state_expire(x);
++	xfrm_dev_offload_put(x);
++
++	return err;
++}
++
++static void airoha_soe_seq_work(struct work_struct *work)
++{
++	struct airoha_soe *soe =
++		container_of(work, struct airoha_soe, seq_work);
++	bool keep_quiesced = false;
++	bool quiesced = airoha_ppe_soe_quiesce(soe->eth);
++	unsigned long flags;
++
++	spin_lock_irqsave(&soe->seq_lock, flags);
++	soe->seq_ppe_quiesced = quiesced;
++	spin_unlock_irqrestore(&soe->seq_lock, flags);
++
++	for (;;) {
++		u32 pending = atomic_xchg(&soe->seq_pending, 0);
++		unsigned int i;
++
++		for (i = 0; i < AIROHA_SOE_NUM_SA; i++) {
++			int err;
++
++			if (!(pending & BIT(i)))
++				continue;
++
++			err = airoha_soe_expire_sa(soe, i);
++			if (err) {
++				keep_quiesced = true;
++				dev_err(soe->dev,
++					"failed to invalidate PPE flows for expired SA %u; keeping IPsec PPE path disabled: %d\n",
++					i, err);
++			}
++		}
++
++		spin_lock_irqsave(&soe->seq_lock, flags);
++		if (atomic_read(&soe->seq_pending)) {
++			spin_unlock_irqrestore(&soe->seq_lock, flags);
++			continue;
++		}
++		quiesced = soe->seq_ppe_quiesced;
++		soe->seq_ppe_quiesced = false;
++		/* Serialize the final enable with fault/deinit marking the provider
++		 * dead so an earlier availability check cannot re-enable it later.
++		 */
++		spin_lock(&soe->state_lock);
++		if (!soe->dead) {
++			writel(AIROHA_SOE_GLB_CFG_ENC_EN |
++				       AIROHA_SOE_GLB_CFG_DEC_EN,
++			       soe->base + AIROHA_SOE_GLB_CFG);
++			readl(soe->base + AIROHA_SOE_GLB_CFG);
++			soe->seq_stopped = false;
++		}
++		spin_unlock(&soe->state_lock);
++		spin_unlock_irqrestore(&soe->seq_lock, flags);
++
++		if (keep_quiesced)
++			airoha_soe_ppe_adopt_quiesce(soe, quiesced);
++		else if (quiesced)
++			airoha_ppe_soe_resume(soe->eth);
++		return;
++	}
++}
++
++static bool airoha_soe_queue_seq_expire(struct airoha_soe *soe, u32 mask)
++{
++	unsigned long flags;
++	bool ambiguous;
++
++	spin_lock_irqsave(&soe->seq_lock, flags);
++	atomic_or(mask, &soe->seq_pending);
++	ambiguous = !!atomic_read(&soe->queued_ctx);
++	soe->seq_stopped = true;
++	/* Stop the engine in hardirq context. The worker serializes PPE and
++	 * state teardown before allowing unaffected SAs to run again.
++	 */
++	writel(0, soe->base + AIROHA_SOE_GLB_CFG);
++	readl(soe->base + AIROHA_SOE_GLB_CFG);
++	spin_unlock_irqrestore(&soe->seq_lock, flags);
++
++	return ambiguous;
++}
++
++static void airoha_soe_cancel_seq_work(struct airoha_soe *soe)
++{
++	unsigned long flags;
++	bool quiesced;
++
++	cancel_work_sync(&soe->seq_work);
++	atomic_set(&soe->seq_pending, 0);
++	spin_lock_irqsave(&soe->seq_lock, flags);
++	quiesced = soe->seq_ppe_quiesced;
++	soe->seq_ppe_quiesced = false;
++	soe->seq_stopped = true;
++	spin_unlock_irqrestore(&soe->seq_lock, flags);
++	if (quiesced)
++		airoha_ppe_soe_resume(soe->eth);
++}
++
++static void airoha_soe_policy_work(struct work_struct *work)
++{
++	struct airoha_soe *soe =
++		container_of(work, struct airoha_soe, policy_work);
++	unsigned long flags;
++	u32 generation;
++	int err;
++
++	for (;;) {
++		spin_lock_irqsave(&soe->policy_lock, flags);
++		if (!soe->policy_quiesced) {
++			spin_unlock_irqrestore(&soe->policy_lock, flags);
++			return;
++		}
++		if (soe->policy_change_count) {
++			spin_unlock_irqrestore(&soe->policy_lock, flags);
++			return;
++		}
++		generation = soe->policy_generation;
++		spin_unlock_irqrestore(&soe->policy_lock, flags);
++
++		err = airoha_ppe_soe_flush_all(soe->eth, soe);
++		if (err) {
++			dev_err(soe->dev,
++				"failed to invalidate SOE flows after XFRM policy change; keeping IPsec PPE path disabled: %d\n",
++				err);
++			return;
++		}
++
++		spin_lock_irqsave(&soe->policy_lock, flags);
++		if (generation != soe->policy_generation) {
++			spin_unlock_irqrestore(&soe->policy_lock, flags);
++			continue;
++		}
++		if (soe->policy_change_count) {
++			spin_unlock_irqrestore(&soe->policy_lock, flags);
++			return;
++		}
++		soe->policy_quiesced = false;
++		spin_unlock_irqrestore(&soe->policy_lock, flags);
++		airoha_ppe_soe_resume(soe->eth);
++		return;
++	}
++}
++
++static void airoha_soe_policy_change(struct net *net, bool complete)
++{
++	struct airoha_soe *soe;
++	unsigned long flags;
++
++	rcu_read_lock();
++	list_for_each_entry_rcu(soe, &airoha_soe_list, list) {
++		if (airoha_soe_available(soe)) {
++			spin_lock_irqsave(&soe->policy_lock, flags);
++			soe->policy_generation++;
++			if (!complete) {
++				if (WARN_ON_ONCE(soe->policy_change_count ==
++						 UINT_MAX)) {
++					spin_unlock_irqrestore(&soe->policy_lock,
++							       flags);
++					continue;
++				}
++				soe->policy_change_count++;
++			} else if (soe->policy_change_count) {
++				soe->policy_change_count--;
++			}
++			if (!soe->policy_quiesced &&
++			    airoha_ppe_soe_quiesce(soe->eth))
++				soe->policy_quiesced = true;
++			if (complete && !soe->policy_change_count &&
++			    soe->policy_quiesced)
++				schedule_work(&soe->policy_work);
++			spin_unlock_irqrestore(&soe->policy_lock, flags);
++		}
++	}
++	rcu_read_unlock();
++}
++
++static void airoha_soe_policy_change_begin(struct net *net)
++{
++	airoha_soe_policy_change(net, false);
++}
++
++static void airoha_soe_policy_changed(struct net *net)
++{
++	airoha_soe_policy_change(net, true);
++}
++
++static int airoha_soe_xfrm_acquire(struct xfrm_state *x,
++				   struct xfrm_tmpl *tmpl,
++				   struct xfrm_policy *policy)
++{
++	return -EOPNOTSUPP;
++}
++
++static struct xfrm_mgr airoha_soe_xfrm_mgr = {
++	.acquire = airoha_soe_xfrm_acquire,
++	.policy_change_begin = airoha_soe_policy_change_begin,
++	.policy_changed = airoha_soe_policy_changed,
++};
++
++static void airoha_soe_policy_register(struct airoha_soe *soe)
++{
++	mutex_lock(&airoha_soe_list_lock);
++	if (!airoha_soe_list_users)
++		xfrm_register_km(&airoha_soe_xfrm_mgr);
++	list_add_tail_rcu(&soe->list, &airoha_soe_list);
++	airoha_soe_list_users++;
++	mutex_unlock(&airoha_soe_list_lock);
++}
++
++static void airoha_soe_policy_unregister(struct airoha_soe *soe)
++{
++	mutex_lock(&airoha_soe_list_lock);
++	list_del_rcu(&soe->list);
++	airoha_soe_list_users--;
++	if (!airoha_soe_list_users)
++		xfrm_unregister_km(&airoha_soe_xfrm_mgr);
++	else
++		synchronize_rcu();
++	mutex_unlock(&airoha_soe_list_lock);
++	cancel_work_sync(&soe->policy_work);
++}
++
++static void airoha_soe_clear_sa_status(struct airoha_soe *soe, u32 mask)
++{
++	writel(mask, soe->base + AIROHA_SOE_CONT_ICV_FAIL_STS);
++	writel(mask, soe->base + AIROHA_SOE_SEQ_NUM_SOFT_STS);
++	writel(mask, soe->base + AIROHA_SOE_BCNT_SOFT_STS);
++	writel(mask, soe->base + AIROHA_SOE_SEQ_NUM_HARD_STS);
++	writel(mask, soe->base + AIROHA_SOE_BCNT_HARD_STS);
++	writel(mask, soe->base + AIROHA_SOE_DEC_ICV_ERR_STS);
++	writel(mask, soe->base + AIROHA_SOE_DEC_SN_ERR_STS);
++	writel(mask, soe->base + AIROHA_SOE_DEC_PAD_ERR_STS);
++}
++
++static u64 airoha_soe_limit(u64 limit)
++{
++	return limit == XFRM_INF ? U64_MAX : limit;
++}
++
++static int airoha_soe_wait_sa_done(struct airoha_soe *soe)
++{
++	u32 done;
++	int err;
++
++	err = readl_poll_timeout(soe->base + AIROHA_SOE_SA_DONE, done,
++				 done & AIROHA_SOE_SA_DONE_W1C, 1,
++				 AIROHA_SOE_SA_TIMEOUT_US);
++	writel(0, soe->base + AIROHA_SOE_SA_CTRL);
++	writel(AIROHA_SOE_SA_DONE_W1C, soe->base + AIROHA_SOE_SA_DONE);
++
++	return err;
++}
++
++static int airoha_soe_commit_sa(struct airoha_soe *soe, unsigned int index)
++{
++	u32 ctrl;
++
++	/* SA registers are a single staging window committed by index. */
++	writel(AIROHA_SOE_SA_DONE_W1C, soe->base + AIROHA_SOE_SA_DONE);
++	ctrl = FIELD_PREP(AIROHA_SOE_SA_CTRL_IDX, index) |
++	       AIROHA_SOE_SA_CTRL_WR;
++	writel(ctrl, soe->base + AIROHA_SOE_SA_CTRL);
++
++	return airoha_soe_wait_sa_done(soe);
++}
++
++static void airoha_soe_write_key(void __iomem *base, u32 reg, const u32 *key)
++{
++	unsigned int i;
++
++	for (i = 0; i < AIROHA_SOE_KEY_WORDS; i++)
++		writel(key[i], base + reg + i * sizeof(u32));
++}
++
++static void airoha_soe_write_addr(void __iomem *base, u32 reg, const u32 *addr)
++{
++	unsigned int i;
++
++	for (i = 0; i < AIROHA_SOE_ADDR_WORDS; i++)
++		writel(addr[i], base + reg + i * sizeof(u32));
++}
++
++static int airoha_soe_program_sa_locked(struct airoha_soe *soe,
++					unsigned int index,
++					const struct airoha_soe_sa_cfg *cfg,
++					bool valid)
++{
++	void __iomem *base = soe->base;
++	u32 cmd = cfg->cmd;
++
++	airoha_soe_clear_sa_status(soe, BIT(index));
++	if (valid)
++		cmd |= AIROHA_SOE_SA_CMD_VLD;
++	writel(cmd, base + AIROHA_SOE_SA_CMD);
++	writel(lower_32_bits(cfg->soft_byte_limit),
++	       base + AIROHA_SOE_BCNT_THSHD_32_SOFT);
++	writel(upper_32_bits(cfg->soft_byte_limit),
++	       base + AIROHA_SOE_BCNT_THSHD_64_SOFT);
++	writel(cfg->spi, base + AIROHA_SOE_SA_SPI);
++	writel(cfg->udp_port, base + AIROHA_SOE_SA_UDP_PORT);
++	airoha_soe_write_key(base, AIROHA_SOE_SA_ENC_KEY(0), cfg->enc_key);
++	airoha_soe_write_key(base, AIROHA_SOE_SA_HMAC_KEY(0), cfg->hmac_key);
++	airoha_soe_write_addr(base, AIROHA_SOE_SA_SRC_ADDR(0), cfg->src_addr);
++	airoha_soe_write_addr(base, AIROHA_SOE_SA_DST_ADDR(0), cfg->dst_addr);
++
++	writel(0, base + AIROHA_SOE_ICV_OK_LO_CNT);
++	writel(0, base + AIROHA_SOE_ICV_OK_HI_CNT);
++	writel(0, base + AIROHA_SOE_ICV_FAIL_LO_CNT);
++	writel(0, base + AIROHA_SOE_ICV_FAIL_HI_CNT);
++	writel(0, base + AIROHA_SOE_CON_ICV_FAIL_CNT);
++	writel(0, base + AIROHA_SOE_SEQ_NUM_LO);
++	writel(0, base + AIROHA_SOE_SEQ_NUM_HI);
++	writel(0, base + AIROHA_SOE_BCNT_LO);
++	writel(0, base + AIROHA_SOE_BCNT_HI);
++	writel(0, base + AIROHA_SOE_FLOW_LAB_DSCP);
++	writel(0, base + AIROHA_SOE_BCNT_80);
++	/* Finite byte lifetimes are rejected, so both high thresholds are all ones. */
++	writel(U32_MAX, base + AIROHA_SOE_BCNT_THSHD_80);
++	writel(lower_32_bits(cfg->hard_byte_limit),
++	       base + AIROHA_SOE_BCNT_THSHD_32_HARD);
++	writel(upper_32_bits(cfg->hard_byte_limit),
++	       base + AIROHA_SOE_BCNT_THSHD_64_HARD);
++	writel(lower_32_bits(cfg->soft_packet_limit),
++	       base + AIROHA_SOE_SEQ_THSHD_32_SOFT);
++	writel(upper_32_bits(cfg->soft_packet_limit),
++	       base + AIROHA_SOE_SEQ_THSHD_64_SOFT);
++	writel(lower_32_bits(cfg->hard_packet_limit),
++	       base + AIROHA_SOE_SEQ_THSHD_32_HARD);
++	writel(upper_32_bits(cfg->hard_packet_limit),
++	       base + AIROHA_SOE_SEQ_THSHD_64_HARD);
++
++	return airoha_soe_commit_sa(soe, index);
++}
++
++static int airoha_soe_clear_sa_locked(struct airoha_soe *soe,
++				      unsigned int index)
++{
++	struct airoha_soe_sa_cfg cfg = {};
++
++	return airoha_soe_program_sa_locked(soe, index, &cfg, false);
++}
++
++static void airoha_soe_copy_words(u32 *dst, const u8 *src, unsigned int bits)
++{
++	unsigned int words = bits / (BITS_PER_BYTE * sizeof(u32));
++	unsigned int i;
++
++	for (i = 0; i < words && i < AIROHA_SOE_KEY_WORDS; i++)
++		dst[i] = get_unaligned_be32(src + i * sizeof(u32));
++}
++
++static int airoha_soe_aes_key_len(unsigned int bits,
++				  struct netlink_ext_ack *extack, u32 *val)
++{
++	switch (bits) {
++	case 128:
++		*val = AIROHA_SOE_AES_KEY_128;
++		return 0;
++	case 192:
++		*val = AIROHA_SOE_AES_KEY_192;
++		return 0;
++	case 256:
++		*val = AIROHA_SOE_AES_KEY_256;
++		return 0;
++	default:
++		NL_SET_ERR_MSG_MOD(extack,
++				   "SOE supports AES-128/192/256 keys only");
++		return -EOPNOTSUPP;
++	}
++}
++
++static int airoha_soe_build_algo(struct xfrm_state *x,
++				 struct airoha_soe_sa_cfg *cfg,
++				 struct netlink_ext_ack *extack)
++{
++	u32 key_len;
++	u32 field;
++	int err;
++
++	if (x->aead) {
++		if (strcmp(x->aead->alg_name, "rfc4106(gcm(aes))")) {
++			NL_SET_ERR_MSG_MOD(extack,
++					   "SOE supports rfc4106(gcm(aes)) AEAD only");
++			return -EOPNOTSUPP;
++		}
++
++		if (x->aead->alg_key_len < 32) {
++			NL_SET_ERR_MSG_MOD(extack, "invalid AEAD key length");
++			return -EINVAL;
++		}
++
++		key_len = x->aead->alg_key_len - 32;
++		err = airoha_soe_aes_key_len(key_len, extack, &field);
++		if (err)
++			return err;
++
++		cfg->cmd |= FIELD_PREP(AIROHA_SOE_SA_CMD_CIPHER,
++				       AIROHA_SOE_CIPHER_AES_GCM);
++		cfg->cmd |= FIELD_PREP(AIROHA_SOE_SA_CMD_AES_KEY_LEN, field);
++		switch (x->aead->alg_icv_len) {
++		case 64:
++			field = 0;
++			break;
++		case 96:
++			field = 1;
++			break;
++		case 128:
++			field = 2;
++			break;
++		default:
++			NL_SET_ERR_MSG_MOD(extack,
++					   "SOE supports 64/96/128-bit GCM ICV only");
++			return -EOPNOTSUPP;
++		}
++		cfg->cmd |= FIELD_PREP(AIROHA_SOE_SA_CMD_GCM_ICV_LEN, field);
++		airoha_soe_copy_words(cfg->enc_key, x->aead->alg_key, key_len);
++		cfg->hmac_key[0] =
++			get_unaligned_be32(x->aead->alg_key + key_len / 8);
++		return 0;
++	}
++
++	if (!x->ealg || strcmp(x->ealg->alg_name, "cbc(aes)")) {
++		NL_SET_ERR_MSG_MOD(extack,
++				   "SOE supports cbc(aes) encryption only");
++		return -EOPNOTSUPP;
++	}
++
++	err = airoha_soe_aes_key_len(x->ealg->alg_key_len, extack, &field);
++	if (err)
++		return err;
++
++	cfg->cmd |=
++		FIELD_PREP(AIROHA_SOE_SA_CMD_CIPHER, AIROHA_SOE_CIPHER_AES_CBC);
++	cfg->cmd |= FIELD_PREP(AIROHA_SOE_SA_CMD_AES_KEY_LEN, field);
++	airoha_soe_copy_words(cfg->enc_key, x->ealg->alg_key,
++			      x->ealg->alg_key_len);
++
++	if (!x->aalg) {
++		NL_SET_ERR_MSG_MOD(extack,
++				   "SOE CBC mode requires HMAC authentication");
++		return -EOPNOTSUPP;
++	}
++
++	if (!strcmp(x->aalg->alg_name, "hmac(sha1)")) {
++		if (x->aalg->alg_key_len != 160 ||
++		    x->aalg->alg_trunc_len != 96) {
++			NL_SET_ERR_MSG_MOD(extack,
++					   "SOE supports HMAC-SHA1-96 only");
++			return -EOPNOTSUPP;
++		}
++		field = AIROHA_SOE_HASH_HMAC_SHA1_96;
++	} else if (!strcmp(x->aalg->alg_name, "hmac(sha256)")) {
++		if (x->aalg->alg_key_len != 256 ||
++		    x->aalg->alg_trunc_len != 128) {
++			NL_SET_ERR_MSG_MOD(extack,
++					   "SOE supports HMAC-SHA256-128 only");
++			return -EOPNOTSUPP;
++		}
++		field = AIROHA_SOE_HASH_HMAC_SHA256_128;
++	} else {
++		NL_SET_ERR_MSG_MOD(extack,
++				   "SOE supports HMAC-SHA1/SHA256 only");
++		return -EOPNOTSUPP;
++	}
++
++	cfg->cmd |= FIELD_PREP(AIROHA_SOE_SA_CMD_HASH, field);
++	airoha_soe_copy_words(cfg->hmac_key, x->aalg->alg_key,
++			      x->aalg->alg_key_len);
++
++	return 0;
++}
++
++static int airoha_soe_build_replay(struct xfrm_state *x,
++				   struct airoha_soe_sa_cfg *cfg,
++				   struct netlink_ext_ack *extack)
++{
++	struct xfrm_replay_state_esn *replay_esn = x->replay_esn;
++	unsigned int i;
++	u32 window;
++
++	if ((x->props.flags & XFRM_STATE_ESN) ||
++	    x->repl_mode == XFRM_REPLAY_MODE_ESN) {
++		NL_SET_ERR_MSG_MOD(extack, "SOE does not support ESN");
++		return -EOPNOTSUPP;
++	}
++
++	if (x->replay.oseq || x->replay.seq || x->replay.bitmap)
++		goto nonzero_replay;
++
++	if (replay_esn) {
++		if (replay_esn->oseq || replay_esn->seq || replay_esn->oseq_hi ||
++		    replay_esn->seq_hi)
++			goto nonzero_replay;
++
++		for (i = 0; i < replay_esn->bmp_len; i++)
++			if (replay_esn->bmp[i])
++				goto nonzero_replay;
++	}
++
++	if (x->xso.dir != XFRM_DEV_OFFLOAD_IN)
++		return 0;
++
++	window = replay_esn ? replay_esn->replay_window :
++			      x->props.replay_window;
++	if (!window)
++		return 0;
++
++	switch (window) {
++	case 64:
++		window = 0;
++		break;
++	case 128:
++		window = 1;
++		break;
++	case 192:
++		window = 2;
++		break;
++	case 256:
++		window = 3;
++		break;
++	default:
++		NL_SET_ERR_MSG_MOD(extack,
++				   "SOE supports replay windows of 64, 128, 192, or 256 packets only");
++		return -EOPNOTSUPP;
++	}
++
++	cfg->cmd |= AIROHA_SOE_SA_CMD_ANTI_RPLY_EN;
++	cfg->cmd |= FIELD_PREP(AIROHA_SOE_SA_CMD_ANTI_RPLY_WDW,
++			       window);
++
++	return 0;
++
++nonzero_replay:
++	NL_SET_ERR_MSG_MOD(extack, "SOE cannot import non-zero replay state");
++	return -EOPNOTSUPP;
++}
++
++static int airoha_soe_build_sa(struct xfrm_state *x,
++			       struct airoha_soe_sa_cfg *cfg,
++			       struct netlink_ext_ack *extack)
++{
++	int err;
++
++	if (x->xso.type != XFRM_DEV_OFFLOAD_PACKET) {
++		NL_SET_ERR_MSG_MOD(extack,
++				   "SOE supports XFRM packet offload only");
++		return -EOPNOTSUPP;
++	}
++
++	if (x->xso.dir != XFRM_DEV_OFFLOAD_OUT &&
++	    x->xso.dir != XFRM_DEV_OFFLOAD_IN) {
++		NL_SET_ERR_MSG_MOD(extack, "SOE supports in/out SAs only");
++		return -EOPNOTSUPP;
++	}
++
++	if (x->id.proto != IPPROTO_ESP) {
++		NL_SET_ERR_MSG_MOD(extack, "SOE supports ESP only");
++		return -EOPNOTSUPP;
++	}
++
++	if (x->props.family != AF_INET || x->outer_mode.family != AF_INET) {
++		NL_SET_ERR_MSG_MOD(extack,
++				   "SOE bring-up supports IPv4 outer tunnel only");
++		return -EOPNOTSUPP;
++	}
++
++	if (x->props.mode != XFRM_MODE_TUNNEL) {
++		NL_SET_ERR_MSG_MOD(extack, "SOE supports tunnel mode only");
++		return -EOPNOTSUPP;
++	}
++
++	if (x->encap && x->encap->encap_type != UDP_ENCAP_ESPINUDP) {
++		NL_SET_ERR_MSG_MOD(extack,
++				   "SOE supports native ESP or UDP_ENCAP_ESPINUDP");
++		return -EOPNOTSUPP;
++	}
++
++	if (x->tfcpad) {
++		NL_SET_ERR_MSG_MOD(extack, "SOE does not support TFC padding");
++		return -EOPNOTSUPP;
++	}
++
++	if (x->props.flags & XFRM_STATE_NOECN) {
++		NL_SET_ERR_MSG_MOD(extack, "SOE cannot disable ECN processing");
++		return -EOPNOTSUPP;
++	}
++
++	if (x->props.flags & ~(XFRM_STATE_DECAP_DSCP | XFRM_STATE_NOPMTUDISC |
++			       XFRM_STATE_AF_UNSPEC | XFRM_STATE_ESN)) {
++		NL_SET_ERR_MSG_MOD(extack,
++				   "SOE does not support the requested SA flags");
++		return -EOPNOTSUPP;
++	}
++
++	if (x->props.extra_flags & ~XFRM_SA_XFLAG_DONT_ENCAP_DSCP) {
++		NL_SET_ERR_MSG_MOD(extack,
++				   "SOE does not support the requested extra SA flags");
++		return -EOPNOTSUPP;
++	}
++
++	if (x->lft.soft_byte_limit != XFRM_INF ||
++	    x->lft.hard_byte_limit != XFRM_INF ||
++	    x->lft.soft_packet_limit != XFRM_INF ||
++	    x->lft.hard_packet_limit != XFRM_INF) {
++		NL_SET_ERR_MSG_MOD(extack,
++				   "SOE does not support byte or packet lifetime limits");
++		return -EOPNOTSUPP;
++	}
++
++	if (x->lft.soft_use_expires_seconds ||
++	    x->lft.hard_use_expires_seconds) {
++		NL_SET_ERR_MSG_MOD(extack,
++				   "SOE does not support use-time lifetime limits");
++		return -EOPNOTSUPP;
++	}
++
++	if (x->curlft.bytes || x->curlft.packets || x->curlft.use_time) {
++		NL_SET_ERR_MSG_MOD(extack,
++				   "SOE cannot import non-zero lifetime counters");
++		return -EOPNOTSUPP;
++	}
++
++	/* Use RFC 3168 ECN handling for both encapsulation and decapsulation. */
++	cfg->cmd |= AIROHA_SOE_SA_CMD_ECN_MODE;
++	if (x->xso.dir == XFRM_DEV_OFFLOAD_OUT) {
++		cfg->cmd |= AIROHA_SOE_SA_CMD_ENC;
++		if (x->props.flags & XFRM_STATE_NOPMTUDISC)
++			cfg->cmd |= AIROHA_SOE_SA_CMD_DF_CFG_EN;
++		if (x->props.extra_flags & XFRM_SA_XFLAG_DONT_ENCAP_DSCP)
++			cfg->cmd |= AIROHA_SOE_SA_CMD_OUT_DSCP_CFG_EN;
++		if (x->encap)
++			cfg->cmd |= AIROHA_SOE_SA_CMD_NAT_EN;
++		cfg->src_addr[0] = be32_to_cpu(x->props.saddr.a4);
++		cfg->dst_addr[0] = be32_to_cpu(x->id.daddr.a4);
++	} else {
++		/* Return packet errors as tagged completions instead of dropping
++		 * them in hardware. This keeps replay validation and failure
++		 * accounting visible to XFRM.
++		 */
++		if (x->props.flags & XFRM_STATE_DECAP_DSCP)
++			cfg->cmd |= AIROHA_SOE_SA_CMD_IN_DSCP_CP_OUT_EN;
++		if (x->encap) {
++			/* RX submit passes the complete UDP-encapsulated packet to
++			 * SOE. Ask the decrypt parser to consume UDP before ESP decap.
++			 */
++			cfg->cmd |= AIROHA_SOE_SA_CMD_DEC_UDP_PARSER_EN;
++		}
++	}
++
++	err = airoha_soe_build_algo(x, cfg, extack);
++	if (err)
++		return err;
++
++	err = airoha_soe_build_replay(x, cfg, extack);
++	if (err)
++		return err;
++
++	cfg->spi = be32_to_cpu(x->id.spi);
++	if (x->encap) {
++		cfg->udp_port =
++			FIELD_PREP(AIROHA_SOE_SA_UDP_PORT_SRC,
++				   ntohs(x->encap->encap_sport)) |
++			FIELD_PREP(AIROHA_SOE_SA_UDP_PORT_DST,
++				   ntohs(x->encap->encap_dport));
++	}
++	cfg->soft_byte_limit = airoha_soe_limit(x->lft.soft_byte_limit);
++	cfg->hard_byte_limit = airoha_soe_limit(x->lft.hard_byte_limit);
++	cfg->soft_packet_limit = airoha_soe_limit(x->lft.soft_packet_limit);
++	/* ESN is unsupported. Leave enough headroom for the expiry worker to
++	 * stop the SA before the 32-bit ESP sequence can wrap.
++	 */
++	cfg->hard_packet_limit = AIROHA_SOE_SEQ_NUM_HARD_LIMIT;
++
++	return 0;
++}
++
++static bool
++airoha_soe_ppe_key_equal(const struct airoha_soe_ppe_key *a,
++			 const struct airoha_soe_ppe_key *b)
++{
++	if (a->saddr != b->saddr || a->daddr != b->daddr ||
++	    a->encap != b->encap)
++		return false;
++
++	return !a->encap ||
++	       (a->sport == b->sport && a->dport == b->dport);
++}
++
++static int
++airoha_soe_ppe_mark_conflicts_locked(struct airoha_soe *soe,
++				     struct airoha_soe_sa *new_sa)
++{
++	bool quiesced = false;
++	bool conflict = false;
++	unsigned int i;
++	int err = 0;
++
++	lockdep_assert_held(&soe->sa_lock);
++
++	if (new_sa->cmd & AIROHA_SOE_SA_CMD_ENC)
++		return 0;
++
++	for (i = 0; i < AIROHA_SOE_NUM_SA; i++) {
++		struct airoha_soe_sa *sa = rcu_access_pointer(soe->sa[i]);
++
++		if (!sa || sa->cmd & AIROHA_SOE_SA_CMD_ENC ||
++		    !airoha_soe_ppe_key_equal(&sa->ppe_key, &new_sa->ppe_key))
++			continue;
++
++		conflict = true;
++		break;
++	}
++	if (!conflict)
++		return 0;
++
++	quiesced = airoha_ppe_soe_quiesce(soe->eth);
++	new_sa->ppe_conflict = true;
++	for (i = 0; i < AIROHA_SOE_NUM_SA; i++) {
++		struct airoha_soe_sa *sa = rcu_access_pointer(soe->sa[i]);
++		int ret;
++
++		if (!sa || sa->cmd & AIROHA_SOE_SA_CMD_ENC ||
++		    !airoha_soe_ppe_key_equal(&sa->ppe_key, &new_sa->ppe_key))
++			continue;
++
++		spin_lock_bh(&sa->lock);
++		sa->ppe_conflict = true;
++		spin_unlock_bh(&sa->lock);
++
++		ret = airoha_ppe_soe_flush_sa(soe->eth, sa);
++		if (ret && !err)
++			err = ret;
++	}
++
++	if (quiesced && !err)
++		airoha_ppe_soe_resume(soe->eth);
++	else if (err)
++		airoha_soe_ppe_adopt_quiesce(soe, quiesced);
++
++	return err;
++}
++
++static void
++airoha_soe_ppe_resolve_conflicts_locked(struct airoha_soe *soe,
++					const struct airoha_soe_sa *removed)
++{
++	struct airoha_soe_sa *remaining = NULL;
++	unsigned int count = 0;
++	unsigned int i;
++
++	lockdep_assert_held(&soe->sa_lock);
++
++	if (removed->cmd & AIROHA_SOE_SA_CMD_ENC)
++		return;
++
++	for (i = 0; i < AIROHA_SOE_NUM_SA; i++) {
++		struct airoha_soe_sa *sa = rcu_access_pointer(soe->sa[i]);
++
++		if (!sa || sa == removed || sa->cmd & AIROHA_SOE_SA_CMD_ENC ||
++		    !airoha_soe_ppe_key_equal(&sa->ppe_key, &removed->ppe_key))
++			continue;
++
++		remaining = sa;
++		count++;
++	}
++	if (count != 1)
++		return;
++
++	spin_lock_bh(&remaining->lock);
++	remaining->ppe_conflict = false;
++	spin_unlock_bh(&remaining->lock);
++}
++
++static int airoha_soe_alloc_sa(struct airoha_soe *soe, struct xfrm_state *x,
++			       struct netlink_ext_ack *extack,
++			       struct airoha_soe_sa **sa)
++{
++	struct airoha_soe_sa_cfg cfg = {};
++	struct airoha_soe_sa *new_sa;
++	unsigned int i;
++	int err;
++
++	if (!soe || !sa || !airoha_soe_available(soe)) {
++		NL_SET_ERR_MSG_MOD(extack, "SOE provider is unavailable");
++		return -ENODEV;
++	}
++
++	err = airoha_soe_build_sa(x, &cfg, extack);
++	if (err)
++		return err;
++
++	new_sa = kzalloc_obj(*new_sa, GFP_KERNEL);
++	if (!new_sa)
++		return -ENOMEM;
++	new_sa->ppe_key.saddr = x->props.saddr.a4;
++	new_sa->ppe_key.daddr = x->id.daddr.a4;
++	new_sa->ppe_key.encap = !!x->encap;
++	if (x->encap) {
++		new_sa->ppe_key.sport = x->encap->encap_sport;
++		new_sa->ppe_key.dport = x->encap->encap_dport;
++	}
++
++	mutex_lock(&soe->sa_lock);
++	if (!airoha_soe_available(soe)) {
++		mutex_unlock(&soe->sa_lock);
++		kfree(new_sa);
++		return -ENODEV;
++	}
++	for (i = 0; i < AIROHA_SOE_NUM_SA; i++) {
++		if (!(soe->sa_map & BIT(i)))
++			break;
++	}
++	if (i == AIROHA_SOE_NUM_SA) {
++		mutex_unlock(&soe->sa_lock);
++		kfree(new_sa);
++		return -ENOSPC;
++	}
++
++	err = airoha_soe_program_sa_locked(soe, i, &cfg, true);
++	if (!err && !airoha_soe_available(soe)) {
++		NL_SET_ERR_MSG_MOD(extack,
++				   "SOE provider became unavailable while programming SA");
++		err = -ENODEV;
++	}
++	if (err) {
++		int clear_err;
++
++		/* A timed-out commit may still have reached SRAM. Prove that the
++		 * slot is invalid before allowing it to be reused.
++		 */
++		clear_err = airoha_soe_clear_sa_locked(soe, i);
++		if (clear_err) {
++			soe->sa_map |= BIT(i);
++			if (airoha_soe_fault_locked(soe))
++				dev_err(soe->dev,
++					"SOE SA %u programming and rollback failed; disabling provider\n",
++					i);
++		}
++		mutex_unlock(&soe->sa_lock);
++		kfree(new_sa);
++		return err;
++	}
++
++	new_sa->soe = soe;
++	new_sa->x = x;
++	new_sa->index = i;
++	new_sa->cmd = cfg.cmd;
++	spin_lock_init(&new_sa->lock);
++	INIT_LIST_HEAD(&new_sa->tx_queue);
++	INIT_LIST_HEAD(&new_sa->rx_queue);
++	INIT_LIST_HEAD(&new_sa->ppe_flows);
++	init_completion(&new_sa->idle);
++	err = airoha_soe_ppe_mark_conflicts_locked(soe, new_sa);
++	if (err)
++		dev_err(soe->dev,
++			"failed to flush conflicting PPE flows; keeping IPsec PPE path disabled: %d\n",
++			err);
++	rcu_assign_pointer(soe->sa[i], new_sa);
++	soe->sa_map |= BIT(i);
++	mutex_unlock(&soe->sa_lock);
++
++	*sa = new_sa;
++	return 0;
++}
++
++static void airoha_soe_free_ctx(struct airoha_soe_ctx *ctx)
++{
++	if (!ctx)
++		return;
++
++	consume_skb(ctx->metadata);
++	if (ctx->dir == AIROHA_SOE_CTX_OUT) {
++		if (ctx->tx.deferred_x)
++			xfrm_state_put(ctx->tx.deferred_x);
++		dst_release(ctx->tx.dst);
++		if (ctx->tx.sk)
++			sock_put(ctx->tx.sk);
++	} else {
++		xfrm_state_put(ctx->rx.x);
++	}
++	kfree(ctx);
++}
++
++static void airoha_soe_purge_bind_tx(struct airoha_soe *soe,
++				     struct airoha_soe_sa *sa)
++{
++	struct airoha_soe_ctx *ctx, *tmp;
++	LIST_HEAD(queue);
++	unsigned long flags;
++	bool kick_worker = false;
++
++	spin_lock_irqsave(&soe->seq_lock, flags);
++	list_for_each_entry_safe(ctx, tmp, &soe->bind_tx_queue, list) {
++		if (sa && ctx->tx.deferred_sa != sa)
++			continue;
++
++		list_move_tail(&ctx->list, &queue);
++		if (!WARN_ON_ONCE(!soe->bind_tx_queued))
++			soe->bind_tx_queued--;
++	}
++	if (!sa)
++		soe->bind_tx_draining = false;
++	else if (soe->bind_tx_draining && !soe->ppe_bind_active)
++		kick_worker = true;
++	spin_unlock_irqrestore(&soe->seq_lock, flags);
++	if (kick_worker)
++		schedule_work(&soe->bind_tx_work);
++
++	list_for_each_entry_safe(ctx, tmp, &queue, list) {
++		struct sk_buff *skb = ctx->tx.deferred_skb;
++
++		list_del_init(&ctx->list);
++		ctx->tx.deferred_skb = NULL;
++		ctx->tx.deferred_sa = NULL;
++		ctx->tx.deferred_dev = NULL;
++		kfree_skb(skb);
++		airoha_soe_free_ctx(ctx);
++	}
++}
++
++static void airoha_soe_restore_metadata(struct sk_buff *skb,
++					struct airoha_soe_ctx *ctx)
++{
++	struct sk_buff *metadata = ctx->metadata;
++	int offset;
++
++	ctx->metadata = NULL;
++	offset = skb_headroom(skb) - skb_headroom(metadata);
++	skb_dst_drop(skb);
++	skb_ext_reset(skb);
++	nf_reset_ct(skb);
++	skb_copy_header(skb, metadata);
++	skb_headers_offset_update(skb, offset);
++	consume_skb(metadata);
++}
++
++static void airoha_soe_purge_ctx_list(struct list_head *head)
++{
++	struct airoha_soe_ctx *ctx, *tmp;
++
++	list_for_each_entry_safe(ctx, tmp, head, list) {
++		list_del(&ctx->list);
++		airoha_soe_free_ctx(ctx);
++	}
++}
++
++static void airoha_soe_detach_queued_ctx(struct airoha_soe_sa *sa,
++					 struct list_head *tx_queue,
++					 struct list_head *rx_queue)
++{
++	unsigned int detached, queued;
++
++	spin_lock_bh(&sa->lock);
++	WARN_ON_ONCE(!sa->dead);
++	detached = list_count_nodes(&sa->rx_queue) +
++		   list_count_nodes(&sa->tx_queue);
++	queued = detached;
++	list_splice_tail_init(&sa->tx_queue, tx_queue);
++	list_splice_tail_init(&sa->rx_queue, rx_queue);
++	sa->completion_seq_map = 0;
++	if (WARN_ON_ONCE(queued > sa->inflight))
++		queued = sa->inflight;
++	sa->inflight -= queued;
++	if (detached)
++		atomic_sub(detached, &sa->soe->queued_ctx);
++	if (!sa->inflight)
++		complete_all(&sa->idle);
++	spin_unlock_bh(&sa->lock);
++	if (detached)
++		airoha_soe_active_ctx_sub(sa->soe, detached);
++}
++
++static void airoha_soe_abort_queued_ctx(struct airoha_soe_sa *sa)
++{
++	LIST_HEAD(rx_queue);
++	LIST_HEAD(tx_queue);
++
++	/* Once dead, the submit path cannot append new contexts. A completion
++	 * racing this detach either owns a context already or observes an empty
++	 * queue and discards its orphaned result.
++	 */
++	airoha_soe_detach_queued_ctx(sa, &tx_queue, &rx_queue);
++	airoha_soe_purge_ctx_list(&tx_queue);
++	airoha_soe_purge_ctx_list(&rx_queue);
++}
++
++static int airoha_soe_deactivate_sa(struct airoha_soe_sa *sa)
++{
++	struct airoha_soe *soe;
++	bool timed_out;
++	bool removed = false;
++	int ppe_err;
++	int err;
++
++	if (!sa)
++		return 0;
++
++	soe = sa->soe;
++	airoha_soe_mark_sa_dead(sa);
++	ppe_err = airoha_ppe_soe_flush_sa(soe->eth, sa);
++	/* A completion loss must not hang XFRM state deletion indefinitely. */
++	timed_out = !wait_for_completion_timeout(&sa->idle, HZ);
++
++	mutex_lock(&soe->sa_lock);
++	if (sa->index < AIROHA_SOE_NUM_SA &&
++	    (rcu_access_pointer(soe->sa[sa->index]) == sa ||
++	     (!rcu_access_pointer(soe->sa[sa->index]) &&
++	      (soe->sa_map & BIT(sa->index)) && !sa->hw_cleared))) {
++		if (timed_out) {
++			sa->quarantined = true;
++			dev_warn(soe->dev,
++				 "SOE SA %u drain timed out; quarantining slot\n",
++				 sa->index);
++		}
++
++		err = airoha_soe_clear_sa_locked(soe, sa->index);
++		if (err)
++			err = airoha_soe_clear_sa_locked(soe, sa->index);
++		if (err)
++			sa->quarantined = true;
++		else
++			sa->hw_cleared = true;
++
++		if (err) {
++			if (airoha_soe_fault_locked(soe))
++				dev_err(soe->dev,
++					"SOE SA %u clear failed; disabling provider: %d\n",
++					sa->index, err);
++			else
++				dev_warn(soe->dev, "failed to clear SOE SA %u: %d\n",
++					 sa->index, err);
++		}
++		if (rcu_access_pointer(soe->sa[sa->index]) == sa) {
++			RCU_INIT_POINTER(soe->sa[sa->index], NULL);
++			airoha_soe_ppe_resolve_conflicts_locked(soe, sa);
++			removed = true;
++		}
++	}
++	mutex_unlock(&soe->sa_lock);
++
++	if (removed)
++		synchronize_rcu();
++
++	if (timed_out) {
++		airoha_soe_abort_queued_ctx(sa);
++		/* Contexts already popped by NAPI still own @sa until finish_ctx(). */
++		wait_for_completion(&sa->idle);
++	}
++
++	return ppe_err;
++}
++
++static void airoha_soe_free_sa(struct airoha_soe_sa *sa)
++{
++	LIST_HEAD(rx_queue);
++	LIST_HEAD(tx_queue);
++	struct airoha_soe *soe;
++	unsigned int queued;
++
++	if (!sa)
++		return;
++
++	soe = sa->soe;
++
++	spin_lock_bh(&sa->lock);
++	WARN_ON_ONCE(sa->inflight);
++	WARN_ON_ONCE(!list_empty(&sa->ppe_flows));
++	queued = list_count_nodes(&sa->tx_queue) +
++		 list_count_nodes(&sa->rx_queue);
++	list_splice_init(&sa->tx_queue, &tx_queue);
++	list_splice_init(&sa->rx_queue, &rx_queue);
++	if (queued)
++		atomic_sub(queued, &soe->queued_ctx);
++	spin_unlock_bh(&sa->lock);
++	if (queued)
++		airoha_soe_active_ctx_sub(soe, queued);
++	airoha_soe_purge_ctx_list(&tx_queue);
++	airoha_soe_purge_ctx_list(&rx_queue);
++
++	/* Keep the slot reserved unless hardware invalidation was proven. */
++	mutex_lock(&soe->sa_lock);
++	if (sa->index < AIROHA_SOE_NUM_SA &&
++	    !rcu_access_pointer(soe->sa[sa->index]) && sa->hw_cleared &&
++	    !sa->quarantined) {
++		soe->sa_map &= ~BIT(sa->index);
++	} else {
++		dev_warn(soe->dev, "quarantining SOE SA slot %u\n",
++			 sa->index);
++	}
++	mutex_unlock(&soe->sa_lock);
++
++	kfree(sa);
++}
++
++static struct airoha_soe_ctx *
++airoha_soe_pop_ctx(struct airoha_soe_sa *sa, enum airoha_soe_ctx_dir dir,
++		   u8 completion_tag)
++{
++	struct airoha_soe_ctx *ctx, *match = NULL;
++	struct list_head *head;
++	unsigned int seq;
++
++	head = dir == AIROHA_SOE_CTX_OUT ? &sa->tx_queue : &sa->rx_queue;
++
++	spin_lock_bh(&sa->lock);
++	list_for_each_entry(ctx, head, list) {
++		if (ctx->completion_tag == completion_tag) {
++			match = ctx;
++			break;
++		}
++	}
++	if (match) {
++		list_del_init(&match->list);
++		seq = FIELD_GET(AIROHA_SOE_COMPLETION_SEQ_MASK,
++				match->completion_tag);
++		if (!WARN_ON_ONCE(!test_bit(seq, &sa->completion_seq_map)))
++			__clear_bit(seq, &sa->completion_seq_map);
++		atomic_dec(&sa->soe->queued_ctx);
++	}
++	spin_unlock_bh(&sa->lock);
++
++	return match;
++}
++
++static void airoha_soe_discard_ctx_list(struct airoha_soe_sa *sa,
++					struct list_head *head)
++{
++	unsigned int count = list_count_nodes(head);
++
++	if (!count)
++		return;
++
++	spin_lock_bh(&sa->lock);
++	if (WARN_ON_ONCE(count > sa->inflight))
++		count = sa->inflight;
++	sa->inflight -= count;
++	if (sa->dead && !sa->inflight)
++		complete(&sa->idle);
++	spin_unlock_bh(&sa->lock);
++	airoha_soe_active_ctx_sub(sa->soe, count);
++	airoha_soe_purge_ctx_list(head);
++}
++
++static void airoha_soe_finish_ctx(struct airoha_soe_sa *sa)
++{
++	bool finished = false;
++
++	spin_lock_bh(&sa->lock);
++	if (!WARN_ON_ONCE(!sa->inflight)) {
++		sa->inflight--;
++		finished = true;
++		if (sa->dead && !sa->inflight)
++			complete(&sa->idle);
++	}
++	spin_unlock_bh(&sa->lock);
++	if (finished)
++		airoha_soe_active_ctx_sub(sa->soe, 1);
++}
++
++static int airoha_soe_prepare_ip_headers(struct sk_buff *skb)
++{
++	unsigned int hdr_len;
++
++	if (!pskb_may_pull(skb, 1))
++		return -EINVAL;
++
++	switch (skb->data[0] & 0xf0) {
++	case 0x40:
++		hdr_len = sizeof(struct iphdr);
++		skb->protocol = htons(ETH_P_IP);
++		break;
++	case 0x60:
++		hdr_len = sizeof(struct ipv6hdr);
++		skb->protocol = htons(ETH_P_IPV6);
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	if (!pskb_may_pull(skb, hdr_len))
++		return -EINVAL;
++
++	skb_reset_network_header(skb);
++	skb_set_transport_header(skb, hdr_len);
++
++	return 0;
++}
++
++bool airoha_soe_rx_is_completion(const void *data, size_t len, u32 msg0)
++{
++	u32 hop_flags = FIELD_GET(QDMA_ETH_RXMSG_HOP_FLAGS_MASK, msg0);
++
++	if (hop_flags < QDMA_ETH_RXMSG_HOP_ENCRYPTED ||
++	    hop_flags > QDMA_ETH_RXMSG_HOP_ERROR_LAST || len < ETH_HLEN)
++		return false;
++
++	return !memcmp(data, airoha_soe_ipv4_l2_header, ETH_HLEN) ||
++	       !memcmp(data, airoha_soe_ipv6_l2_header, ETH_HLEN);
++}
++
++static int airoha_soe_push_l2_header(struct sk_buff *skb)
++{
++	const u8 *l2_header;
++	int err;
++
++	err = airoha_soe_prepare_ip_headers(skb);
++	if (err)
++		return err;
++
++	if (skb->protocol == htons(ETH_P_IP))
++		l2_header = airoha_soe_ipv4_l2_header;
++	else
++		l2_header = airoha_soe_ipv6_l2_header;
++
++	/* TDMA/SOE port 7 expects an Ethernet-looking frame before the SOE hop. */
++	memcpy(skb_push(skb, ETH_HLEN), l2_header, ETH_HLEN);
++
++	return 0;
++}
++
++static void airoha_soe_push_hop_desc(struct sk_buff *skb, unsigned int sa_index,
++				     u8 completion_tag, bool encrypt,
++				     u16 foe_hash, bool foe_valid)
++{
++	u32 hop_direction = encrypt ? AIROHA_SOE_HOP_INFO_ENCRYPT :
++				      AIROHA_SOE_HOP_INFO_DECRYPT;
++	u64 desc3 = ((u64)(u16)((hop_direction << 4) | 0x80) << 48) |
++		    ((u64)(sa_index & 0x3f) << 40) | 0x05dc0000ULL;
++	__le64 desc[4] = {};
++
++	desc[0] = cpu_to_le64(encrypt ? AIROHA_SOE_HOP_DESC0_ENCRYPT :
++					AIROHA_SOE_HOP_DESC0_DECRYPT);
++	desc[1] = cpu_to_le64(AIROHA_SOE_HOP_DESC1);
++	if (foe_valid)
++		desc[2] = cpu_to_le64((u64)foe_hash << 32);
++	desc[3] = cpu_to_le64(desc3);
++	((u8 *)desc)[28] = completion_tag;
++
++	/* The FE/QDMA hop descriptor is consumed by PSE port 7 before SOE. */
++	memcpy(skb_push(skb, AIROHA_SOE_QDMA_HOP_DESC_LEN), desc, sizeof(desc));
++}
++
++static bool airoha_soe_parse_ppe_flow_key(struct sk_buff *skb,
++					  struct airoha_soe_ppe_flow_key *key)
++{
++	struct {
++		__be16 source;
++		__be16 dest;
++	} *ports;
++	struct iphdr *iph;
++	unsigned int len;
++
++	iph = ip_hdr(skb);
++	if ((u8 *)iph < skb->head || (u8 *)(iph + 1) > skb_tail_pointer(skb) ||
++	    iph->version != 4 || iph->ihl < 5 || ip_is_fragment(iph) ||
++	    (iph->protocol != IPPROTO_TCP && iph->protocol != IPPROTO_UDP))
++		return false;
++
++	len = iph->ihl * 4 + sizeof(*ports);
++	if ((u8 *)iph + len > skb_tail_pointer(skb))
++		return false;
++	ports = (void *)iph + iph->ihl * 4;
++
++	key->saddr = iph->saddr;
++	key->daddr = iph->daddr;
++	key->sport = ports->source;
++	key->dport = ports->dest;
++	key->l4proto = iph->protocol;
++
++	return true;
++}
++
++static int
++airoha_soe_defer_tx_locked(struct airoha_soe_sa *sa,
++			   struct airoha_gdm_dev *dev, struct sk_buff *skb,
++			   struct airoha_soe_ctx *ctx, struct xfrm_state *x)
++{
++	struct airoha_soe *soe = sa->soe;
++
++	lockdep_assert_held(&soe->seq_lock);
++	lockdep_assert_held(&sa->lock);
++
++	if (ctx->dir != AIROHA_SOE_CTX_OUT || !x)
++		return -EAGAIN;
++	if (soe->bind_tx_queued >= AIROHA_SOE_BIND_TX_MAX)
++		return -ENOSPC;
++
++	if (ctx->tx.deferred_x) {
++		if (WARN_ON_ONCE(ctx->tx.deferred_x != x))
++			return -EINVAL;
++	} else {
++		xfrm_state_hold(x);
++		ctx->tx.deferred_x = x;
++	}
++	ctx->tx.deferred_skb = skb;
++	ctx->tx.deferred_sa = sa;
++	ctx->tx.deferred_dev = dev;
++	list_add_tail(&ctx->list, &soe->bind_tx_queue);
++	soe->bind_tx_queued++;
++	soe->bind_tx_draining = true;
++
++	return 0;
++}
++
++static int
++airoha_soe_submit_prepared_skb(struct airoha_soe_sa *sa,
++			       struct airoha_gdm_dev *dev, struct sk_buff *skb,
++			       struct airoha_soe_ctx *ctx, struct xfrm_state *x,
++			       bool from_queue)
++{
++	struct net_device *netdev = netdev_from_priv(dev);
++	u32 queue = ctx->dir == AIROHA_SOE_CTX_OUT ?
++			    AIROHA_SOE_QDMA_QUEUE_ENCRYPT :
++			    AIROHA_SOE_QDMA_QUEUE_DECRYPT;
++	bool encrypt = ctx->dir == AIROHA_SOE_CTX_OUT;
++	struct list_head *head;
++	unsigned int seq;
++	unsigned long flags;
++	bool untracked;
++	u32 msg0, msg1;
++	int err;
++
++	msg0 = FIELD_PREP(QDMA_ETH_TXMSG_SOE_SA_MASK, sa->index & 0x3f);
++	msg1 = FIELD_PREP(QDMA_ETH_TXMSG_METER_MASK, 0x7f) |
++	       FIELD_PREP(QDMA_ETH_TXMSG_FPORT_MASK, 7) |
++	       FIELD_PREP(QDMA_ETH_TXMSG_NBOQ_MASK, queue) |
++	       QDMA_ETH_TXMSG_HOP_MASK |
++	       FIELD_PREP(QDMA_ETH_TXMSG_ACNT_G1_MASK, 0x1f) |
++	       FIELD_PREP(QDMA_ETH_TXMSG_ACNT_G0_MASK, 0x3f);
++
++	skb->dev = netdev;
++	skb_set_queue_mapping(skb, AIROHA_SOE_QDMA_TX_RING);
++
++	if (!dev->soe_xmit_skb)
++		return -ENODEV;
++
++	head = ctx->dir == AIROHA_SOE_CTX_OUT ? &sa->tx_queue : &sa->rx_queue;
++	spin_lock_irqsave(&sa->soe->seq_lock, flags);
++	if (sa->soe->seq_stopped) {
++		spin_unlock_irqrestore(&sa->soe->seq_lock, flags);
++		return -EAGAIN;
++	}
++	spin_lock(&sa->lock);
++	if (sa->dead || !airoha_soe_available(sa->soe)) {
++		spin_unlock(&sa->lock);
++		spin_unlock_irqrestore(&sa->soe->seq_lock, flags);
++		return -ENOENT;
++	}
++	untracked = ctx->dir == AIROHA_SOE_CTX_OUT && ctx->tx.ppe_key_valid;
++	if (ctx->dir == AIROHA_SOE_CTX_OUT &&
++	    (sa->soe->ppe_bind_active ||
++	     (!from_queue && sa->soe->bind_tx_draining))) {
++		if (from_queue)
++			err = -EAGAIN;
++		else
++			err = airoha_soe_defer_tx_locked(sa, dev, skb, ctx, x);
++		spin_unlock(&sa->lock);
++		spin_unlock_irqrestore(&sa->soe->seq_lock, flags);
++		return err;
++	}
++	ctx->tx.deferred_skb = NULL;
++	ctx->tx.deferred_sa = NULL;
++	ctx->tx.deferred_dev = NULL;
++	if (untracked) {
++		/* A bound PPE entry consumes the SOE result instead of returning
++		 * it as a CPU completion. The bind barrier has already drained
++		 * every tracked context, so submit packets which raced into the
++		 * CPU path with the reserved completion tag.
++		 */
++		ctx->completion_tag =
++			FIELD_PREP(AIROHA_SOE_COMPLETION_SA_MASK, sa->index) |
++			FIELD_PREP(AIROHA_SOE_COMPLETION_SEQ_MASK,
++				   AIROHA_SOE_COMPLETION_SEQ_UNTRACKED);
++	} else {
++		seq = find_first_zero_bit(&sa->completion_seq_map,
++					  AIROHA_SOE_COMPLETION_SEQ_COUNT);
++		if (seq == AIROHA_SOE_COMPLETION_SEQ_COUNT) {
++			if (ctx->dir == AIROHA_SOE_CTX_OUT && !from_queue)
++				err = airoha_soe_defer_tx_locked(sa, dev, skb, ctx,
++								 x);
++			else
++				err = -EAGAIN;
++			spin_unlock(&sa->lock);
++			spin_unlock_irqrestore(&sa->soe->seq_lock, flags);
++			return err;
++		}
++		__set_bit(seq, &sa->completion_seq_map);
++		ctx->completion_tag =
++			FIELD_PREP(AIROHA_SOE_COMPLETION_SA_MASK, sa->index) |
++			FIELD_PREP(AIROHA_SOE_COMPLETION_SEQ_MASK, seq);
++	}
++	airoha_soe_push_hop_desc(skb, sa->index, ctx->completion_tag, encrypt,
++				 ctx->rx.foe_hash,
++				 ctx->dir == AIROHA_SOE_CTX_IN &&
++				 ctx->rx.foe_valid);
++
++	if (!untracked) {
++		list_add_tail(&ctx->list, head);
++		sa->inflight++;
++		atomic_inc(&sa->soe->queued_ctx);
++		atomic_inc(&sa->soe->active_ctx);
++		reinit_completion(&sa->idle);
++	}
++
++	err = dev->soe_xmit_skb(dev, skb, msg0, msg1,
++				AIROHA_SOE_TXMSG2_DEFAULT);
++	if (err && !untracked) {
++		list_del(&ctx->list);
++		__clear_bit(FIELD_GET(AIROHA_SOE_COMPLETION_SEQ_MASK,
++				      ctx->completion_tag),
++			    &sa->completion_seq_map);
++		atomic_dec(&sa->soe->queued_ctx);
++		atomic_dec(&sa->soe->active_ctx);
++		sa->inflight--;
++		if (sa->dead && !sa->inflight)
++			complete(&sa->idle);
++	}
++	spin_unlock(&sa->lock);
++	spin_unlock_irqrestore(&sa->soe->seq_lock, flags);
++	if (!err && untracked)
++		airoha_soe_free_ctx(ctx);
++
++	return err;
++}
++
++static int airoha_soe_submit_skb(struct airoha_soe_sa *sa,
++				 struct airoha_gdm_dev *dev,
++				 struct sk_buff *skb,
++				 struct airoha_soe_ctx *ctx,
++				 struct xfrm_state *x)
++{
++	unsigned int headroom = AIROHA_SOE_QDMA_HOP_DESC_LEN + ETH_HLEN;
++	int err;
++
++	if (unlikely(!skb_frags_readable(skb)))
++		return -EOPNOTSUPP;
++
++	if (skb_needs_linearize(skb, NETIF_F_SG) && __skb_linearize(skb))
++		return -ENOMEM;
++
++	if (skb->ip_summed == CHECKSUM_PARTIAL) {
++		err = skb_checksum_help(skb);
++		if (err)
++			return err;
++	}
++
++	ctx->metadata = skb_clone(skb, GFP_ATOMIC);
++	if (!ctx->metadata)
++		return -ENOMEM;
++
++	rcu_read_lock();
++	if (skb_dst_is_noref(ctx->metadata) && !skb_dst_force(ctx->metadata)) {
++		rcu_read_unlock();
++		consume_skb(ctx->metadata);
++		ctx->metadata = NULL;
++		return -EHOSTUNREACH;
++	}
++	rcu_read_unlock();
++
++	err = skb_cow_head(skb, headroom);
++	if (err)
++		return err;
++
++	err = airoha_soe_push_l2_header(skb);
++	if (err)
++		return err;
++
++	return airoha_soe_submit_prepared_skb(sa, dev, skb, ctx, x, false);
++}
++
++static void airoha_soe_bind_tx_work(struct work_struct *work)
++{
++	struct airoha_soe *soe =
++		container_of(work, struct airoha_soe, bind_tx_work);
++
++	for (;;) {
++		struct airoha_gdm_dev *dev;
++		struct airoha_soe_ctx *ctx;
++		struct airoha_soe_sa *sa;
++		struct xfrm_state *x;
++		struct sk_buff *skb;
++		unsigned long flags;
++		int err;
++
++		spin_lock_irqsave(&soe->seq_lock, flags);
++		if (soe->ppe_bind_active) {
++			spin_unlock_irqrestore(&soe->seq_lock, flags);
++			return;
++		}
++		if (list_empty(&soe->bind_tx_queue)) {
++			soe->bind_tx_draining = false;
++			spin_unlock_irqrestore(&soe->seq_lock, flags);
++			return;
++		}
++		soe->bind_tx_draining = true;
++
++		ctx = list_first_entry(&soe->bind_tx_queue,
++				       struct airoha_soe_ctx, list);
++		list_del_init(&ctx->list);
++		if (!WARN_ON_ONCE(!soe->bind_tx_queued))
++			soe->bind_tx_queued--;
++		skb = ctx->tx.deferred_skb;
++		sa = ctx->tx.deferred_sa;
++		dev = ctx->tx.deferred_dev;
++		x = ctx->tx.deferred_x;
++		spin_unlock_irqrestore(&soe->seq_lock, flags);
++
++		err = airoha_soe_submit_prepared_skb(sa, dev, skb, ctx, x,
++						     true);
++		if (!err)
++			continue;
++		if (err == -EAGAIN) {
++			spin_lock_irqsave(&soe->seq_lock, flags);
++			ctx->tx.deferred_skb = skb;
++			ctx->tx.deferred_sa = sa;
++			ctx->tx.deferred_dev = dev;
++			list_add(&ctx->list, &soe->bind_tx_queue);
++			soe->bind_tx_queued++;
++			soe->bind_tx_draining = true;
++			spin_unlock_irqrestore(&soe->seq_lock, flags);
++			return;
++		}
++
++		XFRM_INC_STATS(xs_net(x), LINUX_MIB_XFRMOUTERROR);
++		ctx->tx.deferred_skb = NULL;
++		ctx->tx.deferred_sa = NULL;
++		ctx->tx.deferred_dev = NULL;
++		kfree_skb(skb);
++		airoha_soe_free_ctx(ctx);
++	}
++}
++
++int airoha_soe_xmit(struct airoha_soe_sa *sa, struct airoha_gdm_dev *dev,
++		    struct sock *sk, struct sk_buff *skb, struct xfrm_state *x)
++{
++	struct airoha_soe_ctx *ctx;
++	struct dst_entry *path;
++	struct dst_entry *dst;
++	int err;
++
++	if (!sa || !dev || !skb || !x || x->xso.dir != XFRM_DEV_OFFLOAD_OUT)
++		return -EINVAL;
++
++	if (skb_is_gso(skb))
++		return -EOPNOTSUPP;
++
++	dst = skb_dst(skb);
++	if (!dst)
++		return -EHOSTUNREACH;
++
++	path = xfrm_dst_path(dst);
++	if (!path)
++		return -EHOSTUNREACH;
++
++	ctx = kzalloc_obj(*ctx, GFP_ATOMIC);
++	if (!ctx)
++		return -ENOMEM;
++
++	ctx->dir = AIROHA_SOE_CTX_OUT;
++	dst_hold(path);
++	ctx->tx.dst = path;
++	ctx->tx.sk = sk;
++	ctx->tx.tskey = skb_shinfo(skb)->tskey;
++	ctx->tx.tx_flags = skb_shinfo(skb)->tx_flags;
++	ctx->tx.ppe_key_valid =
++		airoha_soe_parse_ppe_flow_key(skb, &ctx->tx.ppe_key);
++	if (sk)
++		sock_hold(sk);
++
++	err = airoha_soe_submit_skb(sa, dev, skb, ctx, x);
++	if (err) {
++		airoha_soe_free_ctx(ctx);
++		return err;
++	}
++
++	return 0;
++}
++
++static bool airoha_soe_rx_parse_ipv4(struct sk_buff *skb,
++				     struct airoha_soe_rx_info *info)
++{
++	struct ip_esp_hdr *esph;
++	struct udphdr *uh;
++	struct iphdr *iph;
++	__be32 saddr, daddr;
++	u8 protocol;
++	int iphlen;
++	int udp_len;
++	int packet_len;
++
++	if (skb->protocol != htons(ETH_P_IP) &&
++	    skb->protocol != htons(ETH_P_XDSA))
++		return false;
++
++	if (!pskb_may_pull(skb, sizeof(*iph)))
++		return false;
++
++	iph = (struct iphdr *)skb->data;
++	if (iph->version != 4 || iph->ihl != 5 || ip_is_fragment(iph) ||
++	    ip_fast_csum((u8 *)iph, iph->ihl))
++		return false;
++
++	iphlen = iph->ihl * 4;
++	packet_len = ntohs(iph->tot_len);
++	if (iphlen < sizeof(*iph) || packet_len > skb->len)
++		return false;
++	saddr = iph->saddr;
++	daddr = iph->daddr;
++	protocol = iph->protocol;
++
++	if (protocol == IPPROTO_ESP) {
++		if (packet_len <= iphlen + sizeof(*esph) ||
++		    !pskb_may_pull(skb, iphlen + sizeof(*esph)))
++			return false;
++
++		esph = (struct ip_esp_hdr *)(skb->data + iphlen);
++		if (!esph->spi)
++			return false;
++
++		info->packet_len = packet_len;
++		info->encap = false;
++		info->saddr = saddr;
++		info->daddr = daddr;
++		info->sport = 0;
++		info->dport = 0;
++		info->spi = esph->spi;
++		info->seq = esph->seq_no;
++
++		return true;
++	}
++
++	if (protocol != IPPROTO_UDP ||
++	    !pskb_may_pull(skb, iphlen + sizeof(*uh) + sizeof(*esph)))
++		return false;
++
++	uh = (struct udphdr *)(skb->data + iphlen);
++	udp_len = ntohs(uh->len);
++	if (udp_len <= sizeof(*uh) + sizeof(*esph) ||
++	    iphlen + udp_len != packet_len || packet_len > skb->len)
++		return false;
++
++	esph = (struct ip_esp_hdr *)(skb->data + iphlen + sizeof(*uh));
++	if (!esph->spi)
++		return false;
++
++	info->packet_len = packet_len;
++	info->encap = true;
++	info->saddr = saddr;
++	info->daddr = daddr;
++	info->sport = uh->source;
++	info->dport = uh->dest;
++	info->spi = esph->spi;
++	info->seq = esph->seq_no;
++
++	return true;
++}
++
++/* Plain ESP/NAT-T first arrives as normal RX, then is bounced to SOE decrypt. */
++bool airoha_soe_rx_plain_skb(struct airoha_gdm_dev *dev, struct sk_buff *skb,
++			     struct net_device *rx_dev, u16 foe_hash,
++			     bool foe_valid, bool foe_unbound)
++{
++	const struct xfrmdev_ops *ops;
++	struct airoha_soe_xfrm_state *state;
++	struct airoha_soe_rx_info info = {};
++	struct airoha_soe_sa *sa;
++	struct airoha_soe_ctx *ctx;
++	struct sec_path *sp;
++	xfrm_address_t daddr = {};
++	struct xfrm_state *x;
++	int err;
++
++	if (!dev || !skb || !rx_dev)
++		return false;
++
++	if (!airoha_soe_available(dev->eth->soe) ||
++	    !(rx_dev->features & NETIF_F_HW_ESP))
++		return false;
++
++	if (!atomic_read(&dev->soe_xfrm_state_count))
++		return false;
++	/* Bound PPE entries can still punt keepalive and exception packets to the
++	 * CPU. Let normal software XFRM handle them without attempting to learn
++	 * the already-bound entry again.
++	 */
++	if (foe_valid && !foe_unbound)
++		return false;
++	if (airoha_soe_ppe_bind_is_active(dev->eth->soe) &&
++	    !(foe_valid && foe_unbound))
++		return false;
++
++	if (!airoha_soe_rx_parse_ipv4(skb, &info))
++		return false;
++
++	daddr.a4 = info.daddr;
++	x = xfrm_input_state_lookup(dev_net(rx_dev), skb->mark, &daddr,
++				    info.spi, IPPROTO_ESP, AF_INET);
++	if (!x)
++		return false;
++	if (!xfrm_dev_offload_get(x)) {
++		xfrm_state_put(x);
++		return false;
++	}
++
++	spin_lock(&x->lock);
++	ops = READ_ONCE(x->xso.state_ops);
++	if (x->km.state != XFRM_STATE_VALID ||
++	    (ops != &airoha_soe_xfrmdev_ops &&
++	     ops != &airoha_soe_dsa_xfrmdev_ops) ||
++	    x->xso.dir != XFRM_DEV_OFFLOAD_IN ||
++	    x->xso.type != XFRM_DEV_OFFLOAD_PACKET || x->xso.dev != rx_dev)
++		goto unlock_state;
++	if ((info.encap &&
++	     (!x->encap || x->encap->encap_type != UDP_ENCAP_ESPINUDP)) ||
++	    (!info.encap && x->encap))
++		goto unlock_state;
++
++	if (info.encap && info.dport != x->encap->encap_dport)
++		goto unlock_state;
++
++	state = (struct airoha_soe_xfrm_state *)x->xso.offload_handle;
++	if (!state || state->dev != dev || !state->sa)
++		goto unlock_state;
++
++	err = xfrm_state_check_expire(x);
++	if (err) {
++		XFRM_INC_STATS(xs_net(x), LINUX_MIB_XFRMINSTATEEXPIRED);
++		spin_unlock(&x->lock);
++		goto drop_state;
++	}
++	sa = state->sa;
++	spin_unlock(&x->lock);
++
++	/* Let the normal XFRM path authenticate and decrypt the flow-learning
++	 * packet. Preserve its hardware flow ID in the unused offload slot; both
++	 * GRO and non-GRO XFRM input retain the slot until flowtable sees the
++	 * authenticated inner packet.
++	 */
++	if (foe_valid) {
++		sp = secpath_set(skb);
++		if (sp && !sp->len && !sp->olen) {
++			sp->ovec[0].hw_flow_id = foe_hash;
++			sp->ovec[0].flags |= XFRM_HW_FLOW_ID;
++		}
++		xfrm_dev_offload_put(x);
++		xfrm_state_put(x);
++		return false;
++	}
++
++	ctx = kzalloc_obj(*ctx, GFP_ATOMIC);
++	if (!ctx)
++		goto put_state;
++
++	ctx->dir = AIROHA_SOE_CTX_IN;
++	ctx->rx.x = x;
++	ctx->rx.dev = rx_dev;
++	ctx->rx.saddr = info.saddr;
++	ctx->rx.sport = info.sport;
++	ctx->rx.seq = info.seq;
++	ctx->rx.foe_hash = foe_hash;
++	ctx->rx.foe_valid = foe_valid;
++
++	/* Allocate and validate the secpath before hardware advances its replay
++	 * window. The metadata clone preserves this writable extension until RX
++	 * completion appends the authenticated state.
++	 */
++	sp = secpath_set(skb);
++	if (!sp || sp->len || sp->olen)
++		goto drop_ctx;
++
++	if (skb->len != info.packet_len && pskb_trim(skb, info.packet_len))
++		goto drop_ctx;
++
++	err = airoha_soe_submit_skb(sa, dev, skb, ctx, x);
++	if (err)
++		goto drop_ctx;
++
++	xfrm_dev_offload_put(x);
++	return true;
++
++drop_ctx:
++	xfrm_dev_offload_put(x);
++	airoha_soe_free_ctx(ctx);
++	kfree_skb(skb);
++	return true;
++drop_state:
++	xfrm_dev_offload_put(x);
++	xfrm_state_put(x);
++	kfree_skb(skb);
++	return true;
++unlock_state:
++	spin_unlock(&x->lock);
++put_state:
++	xfrm_dev_offload_put(x);
++	xfrm_state_put(x);
++	return false;
++}
++
++static bool airoha_soe_complete_out(struct sk_buff *skb,
++				    struct airoha_soe_ctx *ctx)
++{
++	struct dst_entry *dst = ctx->tx.dst;
++	struct sock *sk = ctx->tx.sk;
++	struct net *net;
++	int err;
++
++	if (!ctx->metadata || !pskb_may_pull(skb, ETH_HLEN + 1))
++		goto drop;
++
++	airoha_soe_restore_metadata(skb, ctx);
++	skb_shinfo(skb)->tskey = ctx->tx.tskey;
++	skb_shinfo(skb)->tx_flags = ctx->tx.tx_flags;
++	skb_pull(skb, ETH_HLEN);
++
++	err = airoha_soe_prepare_ip_headers(skb);
++	if (err)
++		goto drop;
++
++	/* Re-enter outer LOCAL_OUT with the path dst after hardware ESP encode. */
++	skb->encapsulation = 0;
++	skb_unset_mac_header(skb);
++	skb->mac_len = 0;
++	skb_dst_drop(skb);
++	skb_dst_set(skb, dst);
++	skb->ignore_df = 1;
++	if (sk)
++		skb_set_owner_w(skb, sk);
++	net = dev_net(dst->dev);
++	ctx->tx.dst = NULL;
++	ctx->tx.sk = NULL;
++	if (ctx->tx.deferred_x)
++		xfrm_state_put(ctx->tx.deferred_x);
++	kfree(ctx);
++
++	nf_reset_ct(skb);
++	err = skb_dst(skb)->ops->local_out(net, sk, skb);
++	if (err == 1)
++		dst_output(net, sk, skb);
++	if (sk)
++		sock_put(sk);
++
++	return true;
++
++drop:
++	airoha_soe_free_ctx(ctx);
++	kfree_skb(skb);
++	return true;
++}
++
++static bool airoha_soe_complete_in(struct sk_buff *skb,
++				   struct airoha_soe_ctx *ctx)
++{
++	struct xfrm_state *x = ctx->rx.x;
++	struct xfrm_offload *xo;
++	struct sec_path *sp;
++	__be16 rx_protocol;
++	int err;
++
++	if (!ctx->metadata || !skb_mac_header_was_set(ctx->metadata) ||
++	    skb_mac_header_len(ctx->metadata) < ETH_HLEN ||
++	    !pskb_may_pull(skb, ETH_HLEN + 1))
++		goto drop;
++
++	rx_protocol = ctx->metadata->protocol;
++	memcpy(skb->data, skb_mac_header(ctx->metadata), ETH_HLEN);
++	airoha_soe_restore_metadata(skb, ctx);
++	skb_reset_mac_header(skb);
++	skb_pull(skb, ETH_HLEN);
++
++	err = airoha_soe_prepare_ip_headers(skb);
++	if (err)
++		goto drop;
++
++	((struct ethhdr *)skb_mac_header(skb))->h_proto = skb->protocol;
++	if (rx_protocol == htons(ETH_P_XDSA))
++		skb->protocol = rx_protocol;
++	skb->ip_summed = CHECKSUM_NONE;
++	skb_reset_mac_len(skb);
++	skb->encapsulation = 0;
++	skb->mark = xfrm_smark_get(skb->mark, x);
++
++	sp = skb_sec_path(skb);
++	if (WARN_ON_ONCE(!sp || sp->len >= XFRM_MAX_DEPTH))
++		goto drop;
++
++	err = xfrm_dev_packet_input_state_check(x, skb, ctx->rx.seq);
++	if (err)
++		goto drop;
++
++	if (x->encap && x->encap->encap_type == UDP_ENCAP_ESPINUDP &&
++	    (ctx->rx.saddr != x->props.saddr.a4 ||
++	     ctx->rx.sport != x->encap->encap_sport)) {
++		struct airoha_soe_xfrm_state *state;
++		xfrm_address_t ipaddr = {
++			.a4 = ctx->rx.saddr,
++		};
++		bool disable_ppe = false;
++
++		state = (struct airoha_soe_xfrm_state *)
++			x->xso.offload_handle;
++		if (state && state->sa) {
++			spin_lock_bh(&state->sa->lock);
++			if (!state->sa->ppe_disabled) {
++				state->sa->ppe_disabled = true;
++				disable_ppe = true;
++			}
++			spin_unlock_bh(&state->sa->lock);
++		}
++		if (disable_ppe && airoha_ppe_soe_quiesce(state->dev->eth)) {
++			state->ppe_flush_quiesced = true;
++			schedule_work(&state->ppe_flush_work);
++		}
++
++		km_new_mapping(x, &ipaddr, ctx->rx.sport);
++	}
++
++	/* Record the transform, but leave olen unchanged so the normal inbound
++	 * XFRM selector and policy checks still run. SOE authenticates the SA;
++	 * it does not implement the security policy database.
++	 */
++	xo = &sp->ovec[0];
++	if (ctx->rx.foe_valid) {
++		xo->hw_flow_id = ctx->rx.foe_hash;
++		xo->flags |= XFRM_HW_FLOW_ID;
++	}
++	sp->xvec[sp->len++] = x;
++	ctx->rx.x = NULL;
++
++	nf_reset_ct(skb);
++	kfree(ctx);
++	netif_rx(skb);
++
++	return true;
++
++drop:
++	airoha_soe_free_ctx(ctx);
++	kfree_skb(skb);
++	return true;
++}
++
++static void
++airoha_soe_complete_untracked_out(struct sk_buff *skb, struct xfrm_state *x)
++{
++	struct flowi4 fl4 = {
++		.flowi4_flags = FLOWI_FLAG_ANYSRC,
++		.flowi4_scope = RT_SCOPE_UNIVERSE,
++	};
++	struct iphdr *iph;
++	struct rtable *rt;
++	struct net *net;
++	int err;
++
++	if (!pskb_may_pull(skb, ETH_HLEN + sizeof(*iph)))
++		goto drop;
++
++	skb_pull(skb, ETH_HLEN);
++	err = airoha_soe_prepare_ip_headers(skb);
++	if (err || skb->protocol != htons(ETH_P_IP))
++		goto drop;
++
++	iph = ip_hdr(skb);
++	net = xs_net(x);
++	fl4.flowi4_mark = xfrm_smark_get(0, x);
++	fl4.flowi4_dscp = ip4h_dscp(iph);
++	fl4.saddr = iph->saddr;
++	fl4.daddr = iph->daddr;
++	rt = __ip_route_output_key(net, &fl4);
++	if (IS_ERR(rt))
++		goto drop;
++
++	skb->dev = rt->dst.dev;
++	skb->mark = fl4.flowi4_mark;
++	skb->encapsulation = 0;
++	skb->ip_summed = CHECKSUM_NONE;
++	skb_unset_mac_header(skb);
++	skb->mac_len = 0;
++	skb_dst_drop(skb);
++	skb_dst_set(skb, &rt->dst);
++	skb->ignore_df = 1;
++	memset(IPCB(skb), 0, sizeof(*IPCB(skb)));
++	IPCB(skb)->flags |= IPSKB_XFRM_TRANSFORMED;
++	nf_reset_ct(skb);
++	ip_local_out(net, NULL, skb);
++
++	return;
++
++drop:
++	XFRM_INC_STATS(xs_net(x), LINUX_MIB_XFRMOUTERROR);
++	kfree_skb(skb);
++}
++
++bool airoha_soe_rx_skb(struct airoha_soe *soe, struct sk_buff *skb,
++		       unsigned int completion_tag, u32 hop_flags)
++{
++	enum airoha_soe_ctx_dir dir;
++	struct airoha_soe_ctx *ctx;
++	struct airoha_soe_sa *sa;
++	struct xfrm_state *x;
++	unsigned int sa_index;
++	u32 success_flag;
++	bool untracked;
++
++	if (!soe || !skb || completion_tag > U8_MAX)
++		return false;
++	sa_index = FIELD_GET(AIROHA_SOE_COMPLETION_SA_MASK, completion_tag);
++	untracked = FIELD_GET(AIROHA_SOE_COMPLETION_SEQ_MASK,
++			      completion_tag) ==
++		    AIROHA_SOE_COMPLETION_SEQ_UNTRACKED;
++
++	rcu_read_lock();
++	sa = rcu_dereference(soe->sa[sa_index]);
++	if (!sa) {
++		rcu_read_unlock();
++		dev_warn_ratelimited(soe->dev,
++				     "orphan SOE completion for SA %u, hop flags %#x\n",
++				     sa_index, hop_flags);
++		return false;
++	}
++
++	dir = sa->cmd & AIROHA_SOE_SA_CMD_ENC ? AIROHA_SOE_CTX_OUT :
++						       AIROHA_SOE_CTX_IN;
++	success_flag = dir == AIROHA_SOE_CTX_OUT ?
++			       AIROHA_SOE_HOP_FLAG_ENCRYPTED :
++			       AIROHA_SOE_HOP_FLAG_DECRYPTED;
++	if (hop_flags != success_flag) {
++		rcu_read_unlock();
++		airoha_soe_rx_drop(soe, completion_tag);
++		kfree_skb(skb);
++		return true;
++	}
++	if (untracked) {
++		if (dir != AIROHA_SOE_CTX_OUT) {
++			rcu_read_unlock();
++			kfree_skb(skb);
++			return true;
++		}
++		x = READ_ONCE(sa->x);
++		if (!x || !xfrm_dev_offload_get(x)) {
++			rcu_read_unlock();
++			kfree_skb(skb);
++			return true;
++		}
++		rcu_read_unlock();
++		airoha_soe_complete_untracked_out(skb, x);
++		xfrm_dev_offload_put(x);
++
++		return true;
++	}
++
++	ctx = airoha_soe_pop_ctx(sa, dir, completion_tag);
++	if (!ctx)
++		airoha_soe_fault_ambiguous_completion(soe, sa, dir);
++	rcu_read_unlock();
++	if (!ctx) {
++		dev_warn_ratelimited(soe->dev,
++				     "SOE SA %u completion tag %#x has no matching %s context\n",
++				     sa_index, completion_tag,
++				     dir == AIROHA_SOE_CTX_OUT ? "outbound" :
++								    "inbound");
++		kfree_skb(skb);
++		return true;
++	}
++	if (dir == AIROHA_SOE_CTX_OUT)
++		airoha_soe_complete_out(skb, ctx);
++	else
++		airoha_soe_complete_in(skb, ctx);
++	airoha_soe_finish_ctx(sa);
++
++	return true;
++}
++
++bool airoha_soe_rx_drop(struct airoha_soe *soe, unsigned int completion_tag)
++{
++	LIST_HEAD(discarded);
++	enum airoha_soe_ctx_dir dir;
++	struct airoha_soe_ctx *ctx;
++	struct airoha_soe_sa *sa;
++	unsigned int sa_index;
++
++	if (!soe || completion_tag > U8_MAX)
++		return false;
++	sa_index = FIELD_GET(AIROHA_SOE_COMPLETION_SA_MASK, completion_tag);
++	if (FIELD_GET(AIROHA_SOE_COMPLETION_SEQ_MASK, completion_tag) ==
++	    AIROHA_SOE_COMPLETION_SEQ_UNTRACKED)
++		return true;
++
++	rcu_read_lock();
++	sa = rcu_dereference(soe->sa[sa_index]);
++	if (!sa) {
++		rcu_read_unlock();
++		return false;
++	}
++	dir = sa->cmd & AIROHA_SOE_SA_CMD_ENC ? AIROHA_SOE_CTX_OUT :
++						       AIROHA_SOE_CTX_IN;
++	ctx = airoha_soe_pop_ctx(sa, dir, completion_tag);
++	if (!ctx) {
++		airoha_soe_fault_ambiguous_completion(soe, sa, dir);
++		rcu_read_unlock();
++		return true;
++	}
++	list_add_tail(&ctx->list, &discarded);
++	rcu_read_unlock();
++	airoha_soe_discard_ctx_list(sa, &discarded);
++
++	return true;
++}
++
++bool airoha_soe_has_pending_ctx(struct airoha_soe *soe)
++{
++	if (!soe)
++		return false;
++
++	return !!atomic_read(&soe->queued_ctx);
++}
++
++static void airoha_soe_xfrm_state_flush_work(struct work_struct *work)
++{
++	struct airoha_soe_xfrm_state *state;
++	int err;
++
++	state = container_of(work, struct airoha_soe_xfrm_state, flush_work);
++	if (!state->sa)
++		return;
++
++	err = airoha_soe_deactivate_sa(state->sa);
++	if (state->ppe_quiesced && !err) {
++		airoha_ppe_soe_resume(state->dev->eth);
++		state->ppe_quiesced = false;
++	}
++	if (err)
++		dev_err(state->soe->dev,
++			"failed to invalidate PPE flows while deleting SA %u; keeping IPsec PPE path disabled: %d\n",
++			state->sa->index, err);
++}
++
++static void airoha_soe_xfrm_ppe_flush_work(struct work_struct *work)
++{
++	struct airoha_soe_xfrm_state *state;
++	int err;
++
++	state = container_of(work, struct airoha_soe_xfrm_state,
++			     ppe_flush_work);
++	if (!state->sa)
++		return;
++
++	err = airoha_ppe_soe_flush_sa(state->dev->eth, state->sa);
++	if (state->ppe_flush_quiesced && !err) {
++		airoha_ppe_soe_resume(state->dev->eth);
++		state->ppe_flush_quiesced = false;
++	}
++	if (err)
++		dev_err(state->soe->dev,
++			"failed to invalidate PPE flows after NAT-T mapping change for SA %u; keeping IPsec PPE path disabled: %d\n",
++			state->sa->index, err);
++}
++
++static int airoha_soe_xfrm_state_add(struct net_device *dev,
++				     struct xfrm_state *x,
++				     struct netlink_ext_ack *extack)
++{
++	struct airoha_soe_xfrm_state *state;
++	struct airoha_gdm_dev *gdm_dev;
++	struct xfrm_state *old;
++	struct airoha_soe *soe;
++	bool update = false;
++	gfp_t gfp;
++	int err;
++
++	if (dev->xfrmdev_ops != &airoha_soe_xfrmdev_ops ||
++	    !(dev->features & NETIF_F_HW_ESP))
++		return -EOPNOTSUPP;
++
++	/* XFRM updates an existing state in place after calling state_add() for
++	 * the replacement object. The old hardware state would otherwise retain
++	 * stale marks, selectors, lifetimes, or NAT-T endpoints, together with
++	 * any autonomous PPE flows. Require delete-and-add for such changes.
++	 */
++	old = xfrm_state_lookup(xs_net(x), x->mark.v, &x->id.daddr,
++				x->id.spi, x->id.proto, x->props.family);
++	if (old) {
++		spin_lock_bh(&old->lock);
++		update = old->km.state == XFRM_STATE_VALID;
++		spin_unlock_bh(&old->lock);
++		xfrm_state_put(old);
++	}
++	if (update) {
++		NL_SET_ERR_MSG_MOD(extack,
++				   "SOE requires delete-and-add for SA updates");
++		return -EOPNOTSUPP;
++	}
++
++	gdm_dev = netdev_priv(dev);
++	soe = airoha_soe_get_ref(gdm_dev->eth->soe);
++	if (!soe)
++		return -ENODEV;
++
++	gfp = (x->xso.flags & XFRM_DEV_OFFLOAD_FLAG_ACQ) ? GFP_ATOMIC :
++							   GFP_KERNEL;
++	state = kzalloc_obj(*state, gfp);
++	if (!state) {
++		airoha_soe_put_ref(soe);
++		return -ENOMEM;
++	}
++
++	state->dev = gdm_dev;
++	state->netdev = dev;
++	state->soe = soe;
++	INIT_WORK(&state->flush_work, airoha_soe_xfrm_state_flush_work);
++	INIT_WORK(&state->ppe_flush_work, airoha_soe_xfrm_ppe_flush_work);
++	dev_hold(dev);
++
++	if (x->xso.flags & XFRM_DEV_OFFLOAD_FLAG_ACQ)
++		goto out;
++
++	err = airoha_soe_alloc_sa(soe, x, extack, &state->sa);
++	if (err)
++		goto err_free;
++	if (x->xso.dir == XFRM_DEV_OFFLOAD_OUT)
++		x->xso.flags |= XFRM_DEV_OFFLOAD_FLAG_FLOWTABLE_INPUT;
++
++	atomic_inc(&gdm_dev->soe_xfrm_state_count);
++	state->counted = true;
++out:
++	x->xso.offload_handle = (unsigned long)state;
++	return 0;
++
++err_free:
++	dev_put(dev);
++	kfree(state);
++	airoha_soe_put_ref(soe);
++	return err;
++}
++
++static void airoha_soe_xfrm_state_delete(struct net_device *dev,
++					 struct xfrm_state *x)
++{
++	struct airoha_soe_xfrm_state *state;
++
++	state = (struct airoha_soe_xfrm_state *)x->xso.offload_handle;
++	if (state && state->sa) {
++		if (!state->ppe_quiesced)
++			state->ppe_quiesced =
++				airoha_ppe_soe_quiesce(state->dev->eth);
++		airoha_soe_mark_sa_dead(state->sa);
++		schedule_work(&state->flush_work);
++	}
++}
++
++static void airoha_soe_xfrm_state_free(struct net_device *dev,
++				       struct xfrm_state *x)
++{
++	struct airoha_soe_xfrm_state *state;
++	int err;
++
++	state = (struct airoha_soe_xfrm_state *)xchg(&x->xso.offload_handle, 0);
++	if (!state)
++		return;
++
++	if (state->sa) {
++		cancel_work_sync(&state->flush_work);
++		if (!state->ppe_quiesced)
++			state->ppe_quiesced =
++				airoha_ppe_soe_quiesce(state->dev->eth);
++		err = airoha_soe_deactivate_sa(state->sa);
++		/* A completion already removed from the SA FIFO can still schedule
++		 * NAT-T mapping work. Drain all contexts before cancelling that work
++		 * so it cannot be queued against a freed state object.
++		 */
++		cancel_work_sync(&state->ppe_flush_work);
++		if (err)
++			err = airoha_ppe_soe_flush_sa(state->dev->eth,
++						      state->sa);
++		if (!err) {
++			if (state->ppe_quiesced)
++				airoha_ppe_soe_resume(state->dev->eth);
++			if (state->ppe_flush_quiesced)
++				airoha_ppe_soe_resume(state->dev->eth);
++		} else {
++			dev_err(state->soe->dev,
++				"failed to invalidate PPE flows before freeing SA %u; keeping IPsec PPE path disabled: %d\n",
++				state->sa->index, err);
++			airoha_ppe_soe_forget_sa(state->dev->eth, state->sa);
++			airoha_soe_ppe_adopt_quiesce(state->soe,
++						     state->ppe_quiesced);
++			airoha_soe_ppe_adopt_quiesce(state->soe,
++						     state->ppe_flush_quiesced);
++		}
++		state->ppe_quiesced = false;
++		state->ppe_flush_quiesced = false;
++		airoha_soe_free_sa(state->sa);
++	}
++	if (state->counted)
++		atomic_dec(&state->dev->soe_xfrm_state_count);
++	dev_put(state->netdev);
++	airoha_soe_put_ref(state->soe);
++	kfree(state);
++}
++
++static bool airoha_soe_xfrm_offload_ok(struct sk_buff *skb,
++				       struct xfrm_state *x)
++{
++	struct airoha_soe_xfrm_state *state;
++	struct airoha_soe_sa *sa;
++	struct net_device *dev = x->xso.dev;
++	bool ok;
++
++	if (!dev || !(dev->features & NETIF_F_HW_ESP))
++		return false;
++
++	if (x->xso.type != XFRM_DEV_OFFLOAD_PACKET ||
++	    x->xso.dir != XFRM_DEV_OFFLOAD_OUT)
++		return false;
++
++	state = (struct airoha_soe_xfrm_state *)x->xso.offload_handle;
++	if (!state || !state->sa || !state->dev || !state->netdev ||
++	    !airoha_soe_available(state->soe))
++		return false;
++
++	sa = state->sa;
++	spin_lock_bh(&sa->lock);
++	ok = !sa->dead && state->sa == sa && sa->soe == state->soe;
++	spin_unlock_bh(&sa->lock);
++
++	return ok;
++}
++
++static int airoha_soe_xfrm_packet_xmit_gso(struct sock *sk,
++					   struct sk_buff *skb,
++					   struct xfrm_state *x,
++					   struct airoha_soe_xfrm_state *state)
++{
++	struct sk_buff *segs, *nskb;
++	int err;
++
++	segs = skb_gso_segment(skb, 0);
++	if (IS_ERR_OR_NULL(segs)) {
++		XFRM_INC_STATS(xs_net(x), LINUX_MIB_XFRMOUTERROR);
++		kfree_skb(skb);
++		return segs ? PTR_ERR(segs) : -EINVAL;
++	}
++
++	consume_skb(skb);
++
++	skb_list_walk_safe(segs, skb, nskb) {
++		skb_mark_not_on_list(skb);
++		err = xfrm_dev_packet_state_check(x, skb);
++		if (err) {
++			kfree_skb(skb);
++			kfree_skb_list(nskb);
++			return err;
++		}
++		err = airoha_soe_xmit(state->sa, state->dev, sk, skb, x);
++		if (err) {
++			XFRM_INC_STATS(xs_net(x), LINUX_MIB_XFRMOUTERROR);
++			kfree_skb(skb);
++			kfree_skb_list(nskb);
++			return err;
++		}
++	}
++
++	return 0;
++}
++
++static int airoha_soe_xfrm_packet_xmit(struct sock *sk, struct sk_buff *skb,
++				       struct xfrm_state *x)
++{
++	struct airoha_soe_xfrm_state *state;
++	struct net_device *netdev;
++	int err = -EHOSTUNREACH;
++
++	state = (struct airoha_soe_xfrm_state *)x->xso.offload_handle;
++	if (!state || !state->sa || !state->dev)
++		goto drop;
++
++	netdev = state->netdev;
++	if (netdev->xfrmdev_ops != &airoha_soe_xfrmdev_ops ||
++	    !(netdev->features & NETIF_F_HW_ESP))
++		goto drop;
++
++	if (skb_is_gso(skb))
++		return airoha_soe_xfrm_packet_xmit_gso(sk, skb, x, state);
++
++	err = xfrm_dev_packet_state_check(x, skb);
++	if (err) {
++		kfree_skb(skb);
++		return err;
++	}
++
++	err = airoha_soe_xmit(state->sa, state->dev, sk, skb, x);
++	if (err)
++		goto drop;
++
++	return 0;
++
++drop:
++	XFRM_INC_STATS(xs_net(x), LINUX_MIB_XFRMOUTERROR);
++	kfree_skb(skb);
++	return err;
++}
++
++static int airoha_soe_xfrm_policy_add(struct xfrm_policy *x,
++				      struct netlink_ext_ack *extack)
++{
++	if (x->xdo.type != XFRM_DEV_OFFLOAD_PACKET) {
++		NL_SET_ERR_MSG_MOD(extack,
++				   "SOE supports XFRM packet policies only");
++		return -EOPNOTSUPP;
++	}
++
++	if (xfrm_policy_id2dir(x->index) >= XFRM_POLICY_MAX) {
++		NL_SET_ERR_MSG_MOD(extack,
++				   "SOE does not offload socket policies");
++		return -EOPNOTSUPP;
++	}
++
++	if (x->xfrm_nr != 1 || x->xfrm_vec[0].id.proto != IPPROTO_ESP) {
++		NL_SET_ERR_MSG_MOD(extack, "SOE offloads ESP policies only");
++		return -EOPNOTSUPP;
++	}
++
++	if (!x->xdo.dev || !(x->xdo.dev->features & NETIF_F_HW_ESP)) {
++		NL_SET_ERR_MSG_MOD(extack, "SOE ESP offload is disabled");
++		return -EOPNOTSUPP;
++	}
++
++	switch (x->xdo.dir) {
++	case XFRM_DEV_OFFLOAD_OUT:
++		return 0;
++	case XFRM_DEV_OFFLOAD_IN:
++		NL_SET_ERR_MSG_MOD(extack,
++				   "SOE requires software inbound XFRM policies");
++		return -EOPNOTSUPP;
++	default:
++		NL_SET_ERR_MSG_MOD(extack,
++				   "SOE offloads outbound policies only");
++		return -EOPNOTSUPP;
++	}
++}
++
++static struct net_device *airoha_soe_dsa_conduit_get(struct airoha_soe *soe,
++						     struct net_device *dev)
++{
++	struct airoha_gdm_dev *gdm_dev;
++	struct net_device *conduit;
++	struct dsa_port *dp;
++
++	if (!dsa_user_dev_check(dev))
++		return NULL;
++
++	/* DSA users expose XFRM, but SOE is attached to their CPU conduit. */
++	dp = dsa_port_from_netdev(dev);
++	if (IS_ERR(dp) || !dp->cpu_dp)
++		return NULL;
++
++	conduit = dsa_port_to_conduit(dp);
++	if (!conduit || conduit->xfrmdev_ops != &airoha_soe_xfrmdev_ops)
++		return NULL;
++
++	gdm_dev = netdev_priv(conduit);
++	if (soe && gdm_dev->eth->soe != soe)
++		return NULL;
++
++	dev_hold(conduit);
++
++	return conduit;
++}
++
++static int airoha_soe_dsa_xfrm_state_add(struct net_device *dev,
++					 struct xfrm_state *x,
++					 struct netlink_ext_ack *extack)
++{
++	struct net_device *conduit;
++	int err;
++
++	if (READ_ONCE(dev->xfrmdev_ops) != &airoha_soe_dsa_xfrmdev_ops ||
++	    !(READ_ONCE(dev->features) & NETIF_F_HW_ESP)) {
++		NL_SET_ERR_MSG_MOD(extack,
++				   "SOE ESP offload is disabled on DSA user");
++		return -EOPNOTSUPP;
++	}
++
++	conduit = airoha_soe_dsa_conduit_get(NULL, dev);
++	if (!conduit) {
++		NL_SET_ERR_MSG_MOD(extack, "SOE DSA conduit is unavailable");
++		return -EOPNOTSUPP;
++	}
++
++	err = airoha_soe_xfrm_state_add(conduit, x, extack);
++	dev_put(conduit);
++
++	return err;
++}
++
++static void airoha_soe_dsa_xfrm_state_delete(struct net_device *dev,
++					     struct xfrm_state *x)
++{
++	airoha_soe_xfrm_state_delete(dev, x);
++}
++
++static void airoha_soe_dsa_xfrm_state_free(struct net_device *dev,
++					   struct xfrm_state *x)
++{
++	airoha_soe_xfrm_state_free(dev, x);
++}
++
++static bool airoha_soe_dsa_xfrm_offload_ok(struct sk_buff *skb,
++					   struct xfrm_state *x)
++{
++	return airoha_soe_xfrm_offload_ok(skb, x);
++}
++
++static int airoha_soe_dsa_xfrm_policy_add(struct xfrm_policy *x,
++					  struct netlink_ext_ack *extack)
++{
++	return airoha_soe_xfrm_policy_add(x, extack);
++}
++
++static int airoha_soe_dsa_xfrm_packet_xmit(struct sock *sk,
++					   struct sk_buff *skb,
++					   struct xfrm_state *x)
++{
++	return airoha_soe_xfrm_packet_xmit(sk, skb, x);
++}
++
++static const struct xfrmdev_ops airoha_soe_xfrmdev_ops = {
++	.xdo_dev_state_add = airoha_soe_xfrm_state_add,
++	.xdo_dev_state_delete = airoha_soe_xfrm_state_delete,
++	.xdo_dev_state_free = airoha_soe_xfrm_state_free,
++	.xdo_dev_offload_ok = airoha_soe_xfrm_offload_ok,
++	.xdo_dev_policy_add = airoha_soe_xfrm_policy_add,
++	.xdo_dev_packet_xmit = airoha_soe_xfrm_packet_xmit,
++};
++
++static const struct xfrmdev_ops airoha_soe_dsa_xfrmdev_ops = {
++	.xdo_dev_state_add = airoha_soe_dsa_xfrm_state_add,
++	.xdo_dev_state_delete = airoha_soe_dsa_xfrm_state_delete,
++	.xdo_dev_state_free = airoha_soe_dsa_xfrm_state_free,
++	.xdo_dev_offload_ok = airoha_soe_dsa_xfrm_offload_ok,
++	.xdo_dev_policy_add = airoha_soe_dsa_xfrm_policy_add,
++	.xdo_dev_packet_xmit = airoha_soe_dsa_xfrm_packet_xmit,
++};
++
++static void airoha_soe_dsa_proxy_enable(struct airoha_soe *soe,
++					struct net_device *dev)
++{
++	struct net_device *conduit;
++
++	if (!airoha_soe_available(soe))
++		return;
++
++	conduit = airoha_soe_dsa_conduit_get(soe, dev);
++	if (!conduit)
++		return;
++
++	if (dev->xfrmdev_ops == &airoha_soe_dsa_xfrmdev_ops &&
++	    dev->hw_features & NETIF_F_HW_ESP)
++		goto out;
++	if (dev->xfrmdev_ops &&
++	    dev->xfrmdev_ops != &airoha_soe_dsa_xfrmdev_ops)
++		goto out;
++
++	/* Mirror ESP capability onto DSA users while programming SAs on the conduit. */
++	dev->xfrmdev_ops = &airoha_soe_dsa_xfrmdev_ops;
++	dev->hw_features |= NETIF_F_HW_ESP;
++	dev->hw_enc_features |= NETIF_F_HW_ESP;
++	dev->wanted_features |= NETIF_F_HW_ESP;
++
++	conduit->wanted_features |= NETIF_F_HW_ESP;
++	netdev_update_features(conduit);
++	netdev_update_features(dev);
++out:
++	dev_put(conduit);
++}
++
++static void airoha_soe_dsa_proxy_clear(struct airoha_soe *soe,
++				       struct net_device *dev)
++{
++	struct net_device *conduit;
++
++	conduit = airoha_soe_dsa_conduit_get(soe, dev);
++	if (!conduit)
++		return;
++
++	if (dev->xfrmdev_ops != &airoha_soe_dsa_xfrmdev_ops)
++		goto out;
++
++	xfrm_dev_state_flush(dev_net(dev), dev, true);
++	xfrm_dev_policy_flush(dev_net(dev), dev, true);
++
++	dev->wanted_features &= ~NETIF_F_HW_ESP;
++	dev->hw_features &= ~NETIF_F_HW_ESP;
++	dev->hw_enc_features &= ~NETIF_F_HW_ESP;
++	netdev_update_features(dev);
++	/* Keep the static proxy callbacks available while unregister waits for
++	 * late XFRM users to drop their netdev references. The core rebroadcasts
++	 * NETDEV_UNREGISTER until that drain completes.
++	 */
++	if (READ_ONCE(dev->reg_state) == NETREG_REGISTERED &&
++	    !READ_ONCE(dev->moving_ns))
++		WRITE_ONCE(dev->xfrmdev_ops, NULL);
++out:
++	dev_put(conduit);
++}
++
++static int airoha_soe_netdev_event(struct notifier_block *nb,
++				   unsigned long event, void *ptr)
++{
++	struct airoha_soe *soe = container_of(nb, struct airoha_soe, netdev_nb);
++	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
++
++	switch (event) {
++	case NETDEV_REGISTER:
++		airoha_soe_dsa_proxy_enable(soe, dev);
++		break;
++	case NETDEV_UNREGISTER:
++		airoha_soe_dsa_proxy_clear(soe, dev);
++		break;
++	case NETDEV_FEAT_CHANGE:
++		if ((dev->xfrmdev_ops == &airoha_soe_xfrmdev_ops ||
++		     dev->xfrmdev_ops == &airoha_soe_dsa_xfrmdev_ops) &&
++		    !(dev->features & NETIF_F_HW_ESP)) {
++			xfrm_dev_state_flush(dev_net(dev), dev, true);
++			xfrm_dev_policy_flush(dev_net(dev), dev, true);
++		}
++		break;
++	}
++
++	return NOTIFY_DONE;
++}
++
++void airoha_soe_build_netdev(struct net_device *netdev,
++			     airoha_soe_xmit_skb_t xmit_skb)
++{
++	struct airoha_gdm_dev *dev = netdev_priv(netdev);
++
++	atomic_set(&dev->soe_xfrm_state_count, 0);
++	dev->soe_xmit_skb = xmit_skb;
++
++	if (!xmit_skb ||
++	    !(airoha_soe_features(dev->eth->soe) & AIROHA_SOE_FEATURE_ESP))
++		return;
++
++	netdev->xfrmdev_ops = &airoha_soe_xfrmdev_ops;
++	netdev->hw_features |= NETIF_F_HW_ESP;
++	netdev->hw_enc_features |= NETIF_F_HW_ESP;
++}
++
++void airoha_soe_teardown_netdev(struct net_device *netdev)
++{
++	struct airoha_gdm_dev *dev = netdev_priv(netdev);
++
++	if (netdev->xfrmdev_ops == &airoha_soe_xfrmdev_ops)
++		netdev->xfrmdev_ops = NULL;
++	dev->soe_xmit_skb = NULL;
++}
++
++int airoha_soe_set_features(struct net_device *netdev,
++			    netdev_features_t features)
++{
++	netdev_features_t changed = (netdev->features ^ features) &
++				    NETIF_F_HW_ESP;
++	struct airoha_gdm_dev *dev = netdev_priv(netdev);
++
++	if (!changed)
++		return 0;
++
++	if ((features & NETIF_F_HW_ESP) &&
++	    !(airoha_soe_features(dev->eth->soe) & AIROHA_SOE_FEATURE_ESP))
++		return -EOPNOTSUPP;
++
++	if (!(features & NETIF_F_HW_ESP) && netdev_uses_dsa(netdev)) {
++		netdev_err(netdev,
++			   "cannot disable ESP features while used as a DSA conduit\n");
++		return -EBUSY;
++	}
++
++	if (atomic_read(&dev->soe_xfrm_state_count)) {
++		netdev_err(netdev,
++			   "cannot change ESP features with active SAs\n");
++		return -EBUSY;
++	}
++
++	return 0;
++}
++
++static irqreturn_t airoha_soe_irq_handler(int irq, void *data)
++{
++	struct airoha_soe *soe = data;
++	u32 affected = 0, enable, error_sa = 0, seq_expired = 0, status;
++	bool seq_ambiguous = false;
++
++	enable = readl(soe->base + AIROHA_SOE_INT_EN);
++	status = readl(soe->base + AIROHA_SOE_INT_STS) & enable &
++		 AIROHA_SOE_INT_ALL;
++	if (!status)
++		return IRQ_NONE;
++
++	writel(status, soe->base + AIROHA_SOE_INT_STS);
++	if (status & AIROHA_SOE_INT_CONT_ICV_FAIL) {
++		u32 mask = readl(soe->base + AIROHA_SOE_CONT_ICV_FAIL_STS);
++
++		writel(mask, soe->base + AIROHA_SOE_CONT_ICV_FAIL_STS);
++		affected |= mask;
++	}
++	if (status & AIROHA_SOE_INT_SEQ_NUM_HARD) {
++		u32 mask = readl(soe->base + AIROHA_SOE_SEQ_NUM_HARD_STS);
++
++		writel(mask, soe->base + AIROHA_SOE_SEQ_NUM_HARD_STS);
++		if (mask) {
++			seq_expired = mask;
++			seq_ambiguous = airoha_soe_queue_seq_expire(soe, mask);
++		}
++	}
++	if ((affected || seq_ambiguous) && airoha_soe_mark_faulted(soe)) {
++		airoha_soe_disable_hw(soe);
++		dev_err_ratelimited(soe->dev,
++				    "SOE fatal SA event on bitmap %#x; disabling provider\n",
++				    affected | (seq_ambiguous ? seq_expired : 0));
++		schedule_work(&soe->fault_work);
++	}
++	if (seq_expired)
++		schedule_work(&soe->seq_work);
++
++	if (status & AIROHA_SOE_INT_DEC_ICV_ERR_DROP) {
++		u32 mask = readl(soe->base + AIROHA_SOE_DEC_ICV_ERR_STS);
++
++		writel(mask, soe->base + AIROHA_SOE_DEC_ICV_ERR_STS);
++		error_sa |= mask;
++	}
++	if (status & AIROHA_SOE_INT_DEC_SN_ERR_DROP) {
++		u32 mask = readl(soe->base + AIROHA_SOE_DEC_SN_ERR_STS);
++
++		writel(mask, soe->base + AIROHA_SOE_DEC_SN_ERR_STS);
++		error_sa |= mask;
++	}
++	if (status & AIROHA_SOE_INT_DEC_PAD_ERR_DROP) {
++		u32 mask = readl(soe->base + AIROHA_SOE_DEC_PAD_ERR_STS);
++
++		writel(mask, soe->base + AIROHA_SOE_DEC_PAD_ERR_STS);
++		error_sa |= mask;
++	}
++	if (status & AIROHA_SOE_INT_PACKET_ERROR) {
++		atomic_or(status & AIROHA_SOE_INT_PACKET_ERROR,
++			  &soe->error_pending);
++		atomic_or(error_sa, &soe->error_sa_pending);
++		schedule_work(&soe->error_work);
++	}
++
++	return IRQ_HANDLED;
++}
++
++static int airoha_soe_wipe_hw(struct airoha_soe *soe)
++{
++	unsigned int i;
++	int err = 0;
++
++	airoha_soe_disable_hw(soe);
++	writel(AIROHA_SOE_INT_ALL, soe->base + AIROHA_SOE_INT_STS);
++	airoha_soe_clear_sa_status(soe, U32_MAX);
++
++	mutex_lock(&soe->sa_lock);
++	for (i = 0; i < AIROHA_SOE_NUM_SA; i++) {
++		err = airoha_soe_clear_sa_locked(soe, i);
++		if (err)
++			break;
++	}
++	mutex_unlock(&soe->sa_lock);
++	if (err)
++		return err;
++
++	writel(AIROHA_SOE_CNT_CLR_ALL, soe->base + AIROHA_SOE_CNT_CLR);
++
++	return 0;
++}
++
++static struct device_node *airoha_soe_find_node(struct airoha_eth *eth)
++{
++	struct device_node *parent, *np;
++
++	if (!eth->dev->of_node)
++		return NULL;
++
++	parent = of_get_parent(eth->dev->of_node);
++	if (!parent)
++		return NULL;
++
++	/* SOE is a sibling DT node; Ethernet owns the provider lifetime. */
++	for_each_child_of_node(parent, np) {
++		if (!of_device_is_available(np) ||
++		    !of_device_is_compatible(np, "airoha,en7581-soe"))
++			continue;
++
++		of_node_put(parent);
++		return np;
++	}
++
++	of_node_put(parent);
++
++	return NULL;
++}
++
++bool airoha_soe_present(struct airoha_eth *eth)
++{
++	struct device_node *np;
++
++	if (!eth)
++		return false;
++
++	np = airoha_soe_find_node(eth);
++	if (!np)
++		return false;
++
++	of_node_put(np);
++
++	return true;
++}
++
++int airoha_soe_init(struct airoha_eth *eth)
++{
++	struct device *dev = eth->dev;
++	struct device_node *np;
++	struct resource res;
++	struct airoha_soe *soe;
++	void __iomem *base;
++	unsigned long flags;
++	int irq, err;
++
++	np = airoha_soe_find_node(eth);
++	if (!np)
++		return 0;
++
++	err = of_address_to_resource(np, 0, &res);
++	if (err)
++		goto put_node;
++
++	base = devm_ioremap_resource(dev, &res);
++	if (IS_ERR(base)) {
++		err = PTR_ERR(base);
++		goto put_node;
++	}
++
++	soe = devm_kzalloc(dev, sizeof(*soe), GFP_KERNEL);
++	if (!soe) {
++		err = -ENOMEM;
++		goto put_node;
++	}
++
++	soe->eth = eth;
++	soe->dev = dev;
++	soe->base = base;
++	INIT_LIST_HEAD(&soe->list);
++	INIT_LIST_HEAD(&soe->ppe_flows);
++	INIT_LIST_HEAD(&soe->bind_tx_queue);
++	mutex_init(&soe->sa_lock);
++	spin_lock_init(&soe->state_lock);
++	spin_lock_init(&soe->seq_lock);
++	spin_lock_init(&soe->policy_lock);
++	atomic_set(&soe->error_pending, 0);
++	atomic_set(&soe->error_sa_pending, 0);
++	atomic_set(&soe->seq_pending, 0);
++	atomic_set(&soe->queued_ctx, 0);
++	atomic_set(&soe->active_ctx, 0);
++	refcount_set(&soe->refcnt, 1);
++	init_completion(&soe->released);
++	INIT_WORK(&soe->fault_work, airoha_soe_fault_work);
++	INIT_WORK(&soe->error_work, airoha_soe_error_work);
++	INIT_WORK(&soe->seq_work, airoha_soe_seq_work);
++	INIT_WORK(&soe->policy_work, airoha_soe_policy_work);
++	INIT_WORK(&soe->bind_tx_work, airoha_soe_bind_tx_work);
++	soe->netdev_nb.notifier_call = airoha_soe_netdev_event;
++
++	err = airoha_soe_wipe_hw(soe);
++	if (err) {
++		err = dev_err_probe(dev, err, "failed to wipe SOE SA table\n");
++		goto put_node;
++	}
++
++	irq = of_irq_get(np, 0);
++	if (irq < 0) {
++		err = dev_err_probe(dev, irq, "failed to get SOE IRQ\n");
++		goto put_node;
++	}
++
++	err = devm_request_irq(dev, irq, airoha_soe_irq_handler, 0,
++			       "airoha-soe", soe);
++	if (err) {
++		err = dev_err_probe(dev, err, "failed to request SOE IRQ\n");
++		goto put_node;
++	}
++	soe->irq = irq;
++
++	/* Error IRQs detect an overlap with CPU-submitted requests, while the
++	 * hard sequence threshold prevents non-ESN ESP sequence wrap.
++	 */
++	spin_lock_irqsave(&soe->seq_lock, flags);
++	writel(AIROHA_SOE_GLB_CFG_ENC_EN | AIROHA_SOE_GLB_CFG_DEC_EN,
++	       base + AIROHA_SOE_GLB_CFG);
++	readl(base + AIROHA_SOE_GLB_CFG);
++	soe->seq_stopped = false;
++	spin_unlock_irqrestore(&soe->seq_lock, flags);
++	writel(AIROHA_SOE_INT_PACKET_ERROR | AIROHA_SOE_INT_SEQ_NUM_HARD,
++	       base + AIROHA_SOE_INT_EN);
++
++	eth->soe = soe;
++	err = register_netdevice_notifier(&soe->netdev_nb);
++	if (err)
++		goto clear_soe;
++	airoha_soe_policy_register(soe);
++
++	of_node_put(np);
++
++	return 0;
++
++clear_soe:
++	eth->soe = NULL;
++	spin_lock_irqsave(&soe->state_lock, flags);
++	soe->dead = true;
++	spin_unlock_irqrestore(&soe->state_lock, flags);
++	airoha_soe_disable_hw(soe);
++	synchronize_irq(soe->irq);
++	cancel_work_sync(&soe->error_work);
++	airoha_soe_cancel_seq_work(soe);
++	cancel_work_sync(&soe->fault_work);
++	writel(AIROHA_SOE_INT_ALL, base + AIROHA_SOE_INT_STS);
++put_node:
++	of_node_put(np);
++
++	return err;
++}
++
++void airoha_soe_deinit(struct airoha_eth *eth)
++{
++	struct airoha_soe *soe = eth->soe;
++	unsigned long flags;
++
++	if (!soe)
++		return;
++	airoha_soe_ppe_quiesce_persistent(soe);
++
++	spin_lock_irqsave(&soe->state_lock, flags);
++	soe->dead = true;
++	spin_unlock_irqrestore(&soe->state_lock, flags);
++	cancel_work_sync(&soe->bind_tx_work);
++	airoha_soe_purge_bind_tx(soe, NULL);
++	airoha_soe_policy_unregister(soe);
++
++	writel(0, soe->base + AIROHA_SOE_INT_EN);
++	synchronize_irq(soe->irq);
++	cancel_work_sync(&soe->error_work);
++	airoha_soe_cancel_seq_work(soe);
++	cancel_work_sync(&soe->fault_work);
++	unregister_netdevice_notifier(&soe->netdev_nb);
++
++	airoha_soe_put_ref(soe);
++	wait_for_completion(&soe->released);
++	/* State teardown can fault and reschedule this work while refs drain. */
++	cancel_work_sync(&soe->bind_tx_work);
++	airoha_soe_purge_bind_tx(soe, NULL);
++	cancel_work_sync(&soe->error_work);
++	airoha_soe_cancel_seq_work(soe);
++	cancel_work_sync(&soe->fault_work);
++	eth->soe = NULL;
++
++	airoha_soe_disable_hw(soe);
++	writel(AIROHA_SOE_INT_ALL, soe->base + AIROHA_SOE_INT_STS);
++}

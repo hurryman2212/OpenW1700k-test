@@ -1,0 +1,252 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jihong Min <hurryman2212@gmail.com>
+Date: Tue, 4 Aug 2026 16:29:39 +0900
+Subject: [PATCH] xfrm: add packet offload state helpers
+
+Add the common helpers needed to manage packet-offloaded XFRM states.
+
+Assisted-by: Codex:gpt-5.6
+Signed-off-by: Jihong Min <hurryman2212@gmail.com>
+---
+ include/net/xfrm.h | 124 ++++++++++++++++++++++++++++++++++-----------
+ 1 file changed, 95 insertions(+), 29 deletions(-)
+
+diff --git a/include/net/xfrm.h b/include/net/xfrm.h
+index af0869c..2c3b544 100644
+--- a/include/net/xfrm.h
++++ b/include/net/xfrm.h
+@@ -144,6 +144,8 @@ enum {
+ 
+ enum {
+ 	XFRM_DEV_OFFLOAD_FLAG_ACQ = 1,
++	/* Defer flowtable creation until an authenticated input SA is known. */
++	XFRM_DEV_OFFLOAD_FLAG_FLOWTABLE_INPUT = 2,
+ };
+ 
+ struct xfrm_dev_offload {
+@@ -154,6 +156,8 @@ struct xfrm_dev_offload {
+ 	 */
+ 	struct net_device	*dev;
+ 	netdevice_tracker	dev_tracker;
++	/* State callbacks captured when the offload is installed. */
++	const struct xfrmdev_ops	*state_ops;
+ 	/* This is a private pointer used by the bonding driver (and eventually
+ 	 * should be moved there). Device drivers should not use it.
+ 	 * Protected by xfrm_state.lock AND bond.ipsec_lock in most cases,
+@@ -162,6 +166,12 @@ struct xfrm_dev_offload {
+ 	 */
+ 	struct net_device	*real_dev;
+ 	unsigned long		offload_handle;
++	/* Snapshot the attached device index for dump paths. */
++	int			ifindex;
++	/* References increment while their caller pins the XFRM state and drain
++	 * before state free. A negative value grants exclusive free ownership.
++	 */
++	atomic_t		active_refs;
+ 	u8			dir : 2;
+ 	u8			type : 2;
+ 	u8			flags : 2;
+@@ -398,6 +408,30 @@ void xfrm_policy_unregister_afinfo(const struct xfrm_policy_afinfo *afinfo);
+ void km_policy_notify(struct xfrm_policy *xp, int dir,
+ 		      const struct km_event *c);
+ void km_state_notify(struct xfrm_state *x, const struct km_event *c);
++#ifdef CONFIG_XFRM
++void xfrm_policy_change_begin(struct net *net);
++void xfrm_policy_change_end(struct net *net);
++u32 xfrm_policy_generation(const struct net *net);
++bool xfrm_policy_flowtable_eligible(const struct net *net);
++#else
++static inline void xfrm_policy_change_begin(struct net *net)
++{
++}
++
++static inline void xfrm_policy_change_end(struct net *net)
++{
++}
++
++static inline u32 xfrm_policy_generation(const struct net *net)
++{
++	return 0;
++}
++
++static inline bool xfrm_policy_flowtable_eligible(const struct net *net)
++{
++	return false;
++}
++#endif
+ 
+ struct xfrm_tmpl;
+ int km_query(struct xfrm_state *x, struct xfrm_tmpl *t,
+@@ -705,6 +739,8 @@ struct xfrm_migrate {
+ struct xfrm_mgr {
+ 	struct list_head	list;
+ 	int			(*notify)(struct xfrm_state *x, const struct km_event *c);
++	void			(*policy_change_begin)(struct net *net);
++	void			(*policy_changed)(struct net *net);
+ 	int			(*acquire)(struct xfrm_state *x, struct xfrm_tmpl *, struct xfrm_policy *xp);
+ 	struct xfrm_policy	*(*compile_policy)(struct sock *sk, int opt, u8 *data, int len, int *dir);
+ 	int			(*new_mapping)(struct xfrm_state *x, xfrm_address_t *ipaddr, __be16 sport);
+@@ -1149,7 +1185,7 @@ struct xfrm_offload {
+ #define	CRYPTO_FALLBACK		8
+ #define	XFRM_GSO_SEGMENT	16
+ #define	XFRM_GRO		32
+-/* 64 is free */
++#define	XFRM_HW_FLOW_ID		64
+ #define	XFRM_DEV_RESUME		128
+ #define	XFRM_XMIT		256
+ 
+@@ -1168,12 +1204,16 @@ struct xfrm_offload {
+ 
+ 	__u8			proto;
+ 	__u8			inner_ipproto;
++	__u32			hw_flow_id;
+ };
+ 
+ struct sec_path {
+ 	int			len;
+ 	int			olen;
+ 	int			verified_cnt;
++	u8			policy_checked;
++	u8			policy_flowtable;
++	u32			policy_genid;
+ 
+ 	struct xfrm_state	*xvec[XFRM_MAX_DEPTH];
+ 	struct xfrm_offload	ovec[XFRM_MAX_OFFLOAD_DEPTH];
+@@ -1250,6 +1290,21 @@ static inline struct xfrm_offload *xfrm_offload(struct sk_buff *skb)
+ #endif
+ }
+ 
++static inline struct xfrm_offload *xfrm_input_offload(struct sk_buff *skb)
++{
++#ifdef CONFIG_XFRM
++	struct sec_path *sp = skb_sec_path(skb);
++
++	if (!sp || sp->olen || !sp->len ||
++	    sp->len > XFRM_MAX_OFFLOAD_DEPTH)
++		return NULL;
++
++	return &sp->ovec[sp->len - 1];
++#else
++	return NULL;
++#endif
++}
++
+ #ifdef CONFIG_XFRM
+ int __xfrm_policy_check(struct sock *, int dir, struct sk_buff *skb,
+ 			unsigned short family);
+@@ -1706,18 +1761,10 @@ struct xfrm_state *xfrm_stateonly_find(struct net *net, u32 mark, u32 if_id,
+ struct xfrm_state *xfrm_state_lookup_byspi(struct net *net, __be32 spi,
+ 					      unsigned short family);
+ int xfrm_state_check_expire(struct xfrm_state *x);
++void xfrm_state_expire(struct xfrm_state *x);
+ void xfrm_state_update_stats(struct net *net);
+ #ifdef CONFIG_XFRM_OFFLOAD
+-static inline void xfrm_dev_state_update_stats(struct xfrm_state *x)
+-{
+-	struct xfrm_dev_offload *xdo = &x->xso;
+-	struct net_device *dev = READ_ONCE(xdo->dev);
+-
+-	if (dev && dev->xfrmdev_ops &&
+-	    dev->xfrmdev_ops->xdo_dev_state_update_stats)
+-		dev->xfrmdev_ops->xdo_dev_state_update_stats(x);
+-
+-}
++void xfrm_dev_state_update_stats(struct xfrm_state *x);
+ #else
+ static inline void xfrm_dev_state_update_stats(struct xfrm_state *x) {}
+ #endif
+@@ -2070,6 +2117,9 @@ static inline void xfrm_states_delete(struct xfrm_state **states, int n)
+ #endif
+ 
+ void __init xfrm_dev_init(void);
++int xfrm_dev_packet_state_check(struct xfrm_state *x, struct sk_buff *skb);
++int xfrm_dev_packet_input_state_check(struct xfrm_state *x, struct sk_buff *skb,
++				      __be32 seq);
+ 
+ #ifdef CONFIG_XFRM_OFFLOAD
+ void xfrm_dev_resume(struct sk_buff *skb);
+@@ -2081,18 +2131,16 @@ int xfrm_dev_state_add(struct net *net, struct xfrm_state *x,
+ int xfrm_dev_policy_add(struct net *net, struct xfrm_policy *xp,
+ 			struct xfrm_user_offload *xuo, u8 dir,
+ 			struct netlink_ext_ack *extack);
++/* Caller holds x; a successful get pins the state, xso.dev, and private
++ * state against free, but not the driver's state-delete callback.
++ */
++bool xfrm_dev_offload_get(struct xfrm_state *x);
++void xfrm_dev_offload_put(struct xfrm_state *x);
+ bool xfrm_dev_offload_ok(struct sk_buff *skb, struct xfrm_state *x);
+ void xfrm_dev_state_delete(struct xfrm_state *x);
+ void xfrm_dev_state_free(struct xfrm_state *x);
+ 
+-static inline void xfrm_dev_state_advance_esn(struct xfrm_state *x)
+-{
+-	struct xfrm_dev_offload *xso = &x->xso;
+-	struct net_device *dev = READ_ONCE(xso->dev);
+-
+-	if (dev && dev->xfrmdev_ops->xdo_dev_state_advance_esn)
+-		dev->xfrmdev_ops->xdo_dev_state_advance_esn(x);
+-}
++void xfrm_dev_state_advance_esn(struct xfrm_state *x);
+ 
+ static inline bool xfrm_dst_offload_ok(struct dst_entry *dst)
+ {
+@@ -2114,24 +2162,33 @@ static inline bool xfrm_dst_offload_ok(struct dst_entry *dst)
+ 
+ static inline void xfrm_dev_policy_delete(struct xfrm_policy *x)
+ {
++	const struct xfrmdev_ops *ops;
+ 	struct xfrm_dev_offload *xdo = &x->xdo;
+-	struct net_device *dev = xdo->dev;
++	struct net_device *dev = READ_ONCE(xdo->dev);
+ 
+-	if (dev && dev->xfrmdev_ops && dev->xfrmdev_ops->xdo_dev_policy_delete)
+-		dev->xfrmdev_ops->xdo_dev_policy_delete(x);
++	if (!dev)
++		return;
++
++	ops = READ_ONCE(dev->xfrmdev_ops);
++	if (ops && ops->xdo_dev_policy_delete)
++		ops->xdo_dev_policy_delete(x);
+ }
+ 
+ static inline void xfrm_dev_policy_free(struct xfrm_policy *x)
+ {
++	const struct xfrmdev_ops *ops;
+ 	struct xfrm_dev_offload *xdo = &x->xdo;
+-	struct net_device *dev = xdo->dev;
++	struct net_device *dev = READ_ONCE(xdo->dev);
+ 
+-	if (dev && dev->xfrmdev_ops) {
+-		if (dev->xfrmdev_ops->xdo_dev_policy_free)
+-			dev->xfrmdev_ops->xdo_dev_policy_free(x);
+-		xdo->dev = NULL;
+-		netdev_put(dev, &xdo->dev_tracker);
+-	}
++	if (!dev)
++		return;
++
++	ops = READ_ONCE(dev->xfrmdev_ops);
++	if (ops && ops->xdo_dev_policy_free)
++		ops->xdo_dev_policy_free(x);
++	WRITE_ONCE(xdo->dev, NULL);
++	xdo->type = XFRM_DEV_OFFLOAD_UNSPECIFIED;
++	netdev_put(dev, &xdo->dev_tracker);
+ }
+ #else
+ static inline void xfrm_dev_resume(struct sk_buff *skb)
+@@ -2160,6 +2217,15 @@ static inline void xfrm_dev_state_free(struct xfrm_state *x)
+ {
+ }
+ 
++static inline bool xfrm_dev_offload_get(struct xfrm_state *x)
++{
++	return false;
++}
++
++static inline void xfrm_dev_offload_put(struct xfrm_state *x)
++{
++}
++
+ static inline int xfrm_dev_policy_add(struct net *net, struct xfrm_policy *xp,
+ 				      struct xfrm_user_offload *xuo, u8 dir,
+ 				      struct netlink_ext_ack *extack)

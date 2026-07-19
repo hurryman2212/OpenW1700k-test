@@ -1,0 +1,145 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jihong Min <hurryman2212@gmail.com>
+Date: Tue, 4 Aug 2026 16:29:39 +0900
+Subject: [PATCH] net: airoha: add SOE state and datapath metadata
+
+Add Ethernet, QDMA, flow and LRO state required by the SOE datapath.
+
+Assisted-by: Codex:gpt-5.6
+Signed-off-by: Jihong Min <hurryman2212@gmail.com>
+---
+ drivers/net/ethernet/airoha/airoha_eth.h | 48 +++++++++++++++++++++++-
+ 1 file changed, 47 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/net/ethernet/airoha/airoha_eth.h b/drivers/net/ethernet/airoha/airoha_eth.h
+index 647ae16..f5028d5 100644
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -16,6 +16,10 @@
+ #include <linux/soc/airoha/airoha_offload.h>
+ #include <net/dsa.h>
+ 
++#include "airoha_soe.h"
++
++struct airoha_soe;
++
+ #define AIROHA_MAX_NUM_GDM_PORTS	4
+ #define AIROHA_MAX_NUM_GDM_DEVS		2
+ #define AIROHA_MAX_NUM_QDMA		2
+@@ -218,10 +222,18 @@ struct airoha_queue {
+ 	int buf_size;
+ 	bool txq_stopped;
+ 	bool flushing;
++	bool rx_coherent;
++	bool rx_drop_chain;
++	void *rx_coherent_buf;
++	dma_addr_t rx_coherent_dma;
+ 
+ 	struct napi_struct napi;
+ 	struct page_pool *page_pool;
+ 	struct sk_buff *skb;
++	/* First SOE descriptor metadata is kept while a scattered frame is built. */
++	int rx_frame_descs;
++	u32 soe_rx_msg0;
++	u32 soe_rx_msg2;
+ 
+ 	struct list_head tx_list;
+ };
+@@ -490,6 +502,7 @@ enum airoha_flow_entry_type {
+ 	FLOW_TYPE_L4,
+ 	FLOW_TYPE_L2,
+ 	FLOW_TYPE_L2_SUBFLOW,
++	FLOW_TYPE_SOE_INPUT_OWNER,
+ };
+ 
+ struct airoha_flow_table_entry {
+@@ -525,6 +538,10 @@ struct airoha_flow_table_entry {
+ 
+ 	struct rhash_head node;
+ 	unsigned long cookie;
++	struct list_head soe_bind_node;
++	u32 soe_bind_hash;
++	bool soe_bind_rx_wlan;
++	struct airoha_soe_ppe_flow soe_flow;
+ 
+ 	/* Must be last --ends in a flexible-array member. */
+ 	struct airoha_foe_entry data;
+@@ -590,6 +607,11 @@ struct airoha_gdm_dev {
+ 
+ 	u32 flags;
+ 	int nbq;
++	/* Prevent toggling NETIF_F_HW_ESP while programmed SAs still exist. */
++	atomic_t soe_xfrm_state_count;
++	/* Private SOE submit path into this GDM's active QDMA instance. */
++	int (*soe_xmit_skb)(struct airoha_gdm_dev *dev, struct sk_buff *skb,
++			    u32 msg0, u32 msg1, u32 msg2);
+ 
+ 	struct airoha_hw_stats stats;
+ 
+@@ -622,6 +644,8 @@ struct airoha_ppe {
+ 
+ 	struct hlist_head *foe_flow;
+ 	u16 *foe_check_time;
++	unsigned int soe_quiesce_count;
++	struct list_head soe_bind_pending;
+ 
+ 	struct airoha_foe_stats *foe_stats;
+ 	dma_addr_t foe_stats_dma;
+@@ -666,6 +690,9 @@ struct airoha_eth {
+ 
+ 	struct airoha_qdma qdma[AIROHA_MAX_NUM_QDMA];
+ 	struct airoha_gdm_port *ports[AIROHA_MAX_NUM_GDM_PORTS];
++	struct airoha_soe *soe;
++	bool soe_present;
++	bool natt_ifc_ready;
+ };
+ 
+ u32 airoha_rr(void __iomem *base, u32 offset);
+@@ -727,12 +754,18 @@ static inline bool airoha_qdma_is_lro_queue(struct airoha_queue *q)
+ 	BUILD_BUG_ON(hweight32(AIROHA_RXQ_LRO_EN_MASK) >
+ 		     AIROHA_MAX_NUM_LRO_QUEUES);
+ 
++	/* SOE completions can use low RX rings; keep LRO on high rings. */
++	if (qdma->eth->soe_present)
++		return qid >= AIROHA_NUM_RX_RING - AIROHA_MAX_NUM_LRO_QUEUES;
++
+ 	return !!(AIROHA_RXQ_LRO_EN_MASK & BIT(qid));
+ }
+ 
+ int airoha_get_fe_port(struct airoha_gdm_dev *dev);
+ bool airoha_is_valid_gdm_dev(struct airoha_eth *eth,
+ 			     struct airoha_gdm_dev *dev);
++int airoha_qdma_xmit_skb(struct airoha_gdm_dev *dev, struct sk_buff *skb,
++			 u32 msg0, u32 msg1, u32 msg2);
+ 
+ extern struct mutex flow_offload_mutex;
+ 
+@@ -749,7 +782,8 @@ void airoha_ppe_set_cpu_port(struct airoha_gdm_dev *dev, u8 ppe_id, u8 fport);
+ bool airoha_ppe_is_enabled(struct airoha_eth *eth, int index);
+ void airoha_ppe_check_skb(struct airoha_ppe_dev *dev, struct sk_buff *skb,
+ 			  u16 hash, bool rx_wlan);
+-int airoha_ppe_setup_tc_block_cb(struct airoha_ppe_dev *dev, void *type_data);
++int airoha_ppe_setup_tc_block_cb(struct airoha_ppe_dev *dev, void *type_data,
++				 bool is_flowtable);
+ int airoha_ppe_init(struct airoha_eth *eth);
+ void airoha_ppe_deinit(struct airoha_eth *eth);
+ void airoha_ppe_init_upd_mem(struct airoha_gdm_dev *dev, const u8 *addr);
+@@ -758,6 +792,18 @@ struct airoha_foe_entry *airoha_ppe_foe_get_entry(struct airoha_ppe *ppe,
+ 						  u32 hash);
+ void airoha_ppe_foe_entry_get_stats(struct airoha_ppe *ppe, u32 hash,
+ 				    struct airoha_foe_stats64 *stats);
++int airoha_ppe_soe_flush_sa(struct airoha_eth *eth,
++			    struct airoha_soe_sa *sa);
++int airoha_ppe_soe_flush_all(struct airoha_eth *eth,
++			     struct airoha_soe *soe);
++void airoha_ppe_soe_forget_sa(struct airoha_eth *eth,
++			      struct airoha_soe_sa *sa);
++bool airoha_ppe_soe_quiesce(struct airoha_eth *eth);
++void airoha_ppe_soe_resume(struct airoha_eth *eth);
++bool airoha_ppe_soe_is_quiesced(struct airoha_eth *eth);
++void airoha_ppe_soe_bind_ready(struct airoha_eth *eth);
++void airoha_ppe_soe_bind_cancel(struct airoha_eth *eth,
++				struct airoha_soe_ppe_flow *flow);
+ 
+ #ifdef CONFIG_DEBUG_FS
+ int airoha_ppe_debugfs_init(struct airoha_ppe *ppe);

@@ -1,0 +1,80 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jihong Min <hurryman2212@gmail.com>
+Date: Tue, 4 Aug 2026 16:29:39 +0900
+Subject: [PATCH] netfilter: flowtable: keep XFRM flows off software path
+
+Keep packet-offloaded XFRM traffic out of the software flowtable path.
+
+Assisted-by: Codex:gpt-5.6
+Signed-off-by: Jihong Min <hurryman2212@gmail.com>
+---
+ net/netfilter/nf_flow_table_ip.c | 35 ++++++++++++++++++++++++++++++++
+ 1 file changed, 35 insertions(+)
+
+diff --git a/net/netfilter/nf_flow_table_ip.c b/net/netfilter/nf_flow_table_ip.c
+index e6da8f2..c313ff2 100644
+--- a/net/netfilter/nf_flow_table_ip.c
++++ b/net/netfilter/nf_flow_table_ip.c
+@@ -15,6 +15,7 @@
+ #include <net/neighbour.h>
+ #include <net/netfilter/nf_flow_table.h>
+ #include <net/netfilter/nf_conntrack_acct.h>
++#include <net/xfrm.h>
+ /* For layer 4 checksum field offset. */
+ #include <linux/tcp.h>
+ #include <linux/udp.h>
+@@ -40,6 +41,30 @@ static int nf_flow_state_check(struct flow_offload *flow, int proto,
+ 	return 0;
+ }
+ 
++static bool
++nf_flow_xfrm_policy_stale(struct flow_offload_tuple_rhash *tuplehash)
++{
++#if IS_ENABLED(CONFIG_XFRM)
++	struct flow_offload_tuple *tuple = &tuplehash->tuple;
++	struct flow_offload *flow;
++	int dir;
++
++	if (!tuple->xfrm_policy_genid)
++		return false;
++
++	dir = tuple->dir;
++	flow = container_of(tuplehash, struct flow_offload, tuplehash[dir]);
++	if (tuple->xfrm_policy_genid ==
++	    xfrm_policy_generation(nf_ct_net(flow->ct)))
++		return false;
++
++	flow_offload_teardown(flow);
++	return true;
++#else
++	return false;
++#endif
++}
++
+ static void nf_flow_nat_ip_tcp(struct sk_buff *skb, unsigned int thoff,
+ 			       __be32 addr, __be32 new_addr)
+ {
+@@ -440,6 +465,11 @@ nf_flow_offload_ip_hook(void *priv, struct sk_buff *skb,
+ 	tuplehash = nf_flow_offload_lookup(&ctx, flow_table, skb);
+ 	if (!tuplehash)
+ 		return NF_ACCEPT;
++	if (nf_flow_xfrm_policy_stale(tuplehash))
++		return NF_ACCEPT;
++	if (tuplehash->tuple.xfrm_input ||
++	    tuplehash->tuple.xfrm_input_deferred)
++		return NF_ACCEPT;
+ 
+ 	ret = nf_flow_offload_forward(&ctx, flow_table, tuplehash, skb);
+ 	if (ret < 0)
+@@ -742,6 +772,11 @@ nf_flow_offload_ipv6_hook(void *priv, struct sk_buff *skb,
+ 	tuplehash = nf_flow_offload_ipv6_lookup(&ctx, flow_table, skb);
+ 	if (tuplehash == NULL)
+ 		return NF_ACCEPT;
++	if (nf_flow_xfrm_policy_stale(tuplehash))
++		return NF_ACCEPT;
++	if (tuplehash->tuple.xfrm_input ||
++	    tuplehash->tuple.xfrm_input_deferred)
++		return NF_ACCEPT;
+ 
+ 	ret = nf_flow_offload_ipv6_forward(&ctx, flow_table, tuplehash, skb);
+ 	if (ret < 0)
