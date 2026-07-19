@@ -1,0 +1,208 @@
+From b73350a771a304ec1ce8f2bfa74cd8f284fc1b65 Mon Sep 17 00:00:00 2001
+From: Jihong Min <hurryman2212@gmail.com>
+Date: Thu, 23 Jul 2026 01:48:28 +0900
+Subject: [PATCH 27/43] net: airoha: add the SOE PPE flow interface
+
+Declare the SOE flow binding state and the quiesce, flush, deferred
+binding, and shared binding operations used by the Ethernet and SOE
+providers.
+
+Assisted-by: Codex:gpt-5.6
+Signed-off-by: Jihong Min <hurryman2212@gmail.com>
+---
+ drivers/net/ethernet/airoha/airoha_soe.h | 129 ++++++++++++++++++++++-
+ 1 file changed, 125 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/net/ethernet/airoha/airoha_soe.h b/drivers/net/ethernet/airoha/airoha_soe.h
+index 97accd20ebdd..25b0da42a314 100644
+--- a/drivers/net/ethernet/airoha/airoha_soe.h
++++ b/drivers/net/ethernet/airoha/airoha_soe.h
+@@ -17,6 +17,7 @@
+ #include <linux/bitops.h>
+ #include <linux/errno.h>
+ #include <linux/kconfig.h>
++#include <linux/list.h>
+ #include <linux/netdev_features.h>
+ #include <linux/types.h>
+ 
+@@ -38,6 +39,38 @@ typedef int (*airoha_soe_xmit_skb_t)(struct airoha_gdm_dev *dev,
+ 				     struct sk_buff *skb, u32 msg0, u32 msg1,
+ 				     u32 msg2);
+ 
++struct airoha_soe_ppe_flow_key {
++	__be32 saddr;
++	__be32 daddr;
++	__be16 sport;
++	__be16 dport;
++	u8 l4proto;
++};
++
++struct airoha_soe_ppe_flow {
++	struct list_head sa_node;
++	struct list_head soe_node;
++	struct airoha_soe *soe;
++	struct airoha_soe_sa *sa;
++	struct airoha_soe_ppe_flow_key key;
++	u64 bind_generation;
++	bool key_valid;
++	bool input;
++	bool bind_preparing;
++	bool bound;
++};
++
++struct airoha_soe_ppe_info {
++	__be32 saddr;
++	__be32 daddr;
++	__be32 spi;
++	__be16 sport;
++	__be16 dport;
++	u8 sa_index;
++	u8 hop;
++	bool encap;
++};
++
+ #if IS_ENABLED(CONFIG_NET_AIROHA_SOE)
+ bool airoha_soe_present(struct airoha_eth *eth);
+ int airoha_soe_init(struct airoha_eth *eth);
+@@ -54,10 +87,31 @@ bool airoha_soe_rx_skb(struct airoha_soe *soe, struct sk_buff *skb,
+ bool airoha_soe_rx_drop(struct airoha_soe *soe,
+ 			unsigned int completion_tag);
+ bool airoha_soe_rx_plain_skb(struct airoha_gdm_dev *dev, struct sk_buff *skb,
+-			     struct net_device *rx_dev);
++			     struct net_device *rx_dev, u16 foe_hash,
++			     bool foe_valid, bool foe_unbound);
+ bool airoha_soe_has_pending_ctx(struct airoha_soe *soe);
+ int airoha_soe_xmit(struct airoha_soe_sa *sa, struct airoha_gdm_dev *dev,
+ 		    struct sock *sk, struct sk_buff *skb, struct xfrm_state *x);
++int airoha_soe_ppe_flow_add(struct airoha_soe *soe, struct xfrm_state *x,
++			    u8 dir, struct airoha_soe_ppe_flow *flow,
++			    struct airoha_soe_ppe_info *info);
++void airoha_soe_ppe_flow_del(struct airoha_soe_ppe_flow *flow);
++bool airoha_soe_ppe_flow_bind_start(struct airoha_soe_ppe_flow *flow,
++				    bool *ready);
++bool airoha_soe_ppe_flow_bind_ready(struct airoha_soe_ppe_flow *flow);
++bool airoha_soe_ppe_flow_bind_finish(struct airoha_soe_ppe_flow *flow);
++bool airoha_soe_ppe_flow_bind_share(struct airoha_soe_ppe_flow *flow,
++				    const struct airoha_soe_ppe_flow *source);
++bool airoha_soe_ppe_flow_bind_clone(struct airoha_soe_ppe_flow *flow,
++				    const struct airoha_soe_ppe_flow *source);
++void airoha_soe_ppe_flow_bind_abort(struct airoha_soe_ppe_flow *flow);
++void airoha_soe_ppe_flow_unbind(struct airoha_soe_ppe_flow *flow);
++void airoha_soe_ppe_flow_restore(struct airoha_soe_ppe_flow *flow);
++void airoha_soe_ppe_adopt_quiesce(struct airoha_soe *soe, bool quiesced);
++struct airoha_soe_ppe_flow *
++airoha_soe_ppe_flow_pop_sa(struct airoha_soe_sa *sa);
++struct airoha_soe_ppe_flow *
++airoha_soe_ppe_flow_pop_all(struct airoha_soe *soe);
+ #else
+ static inline bool airoha_soe_present(struct airoha_eth *eth)
+ {
+@@ -106,20 +160,22 @@ static inline bool airoha_soe_rx_is_completion(const void *data, size_t len,
+ 
+ static inline bool airoha_soe_rx_skb(struct airoha_soe *soe,
+ 				     struct sk_buff *skb,
+-				     unsigned int sa_index, u32 hop_flags)
++				     unsigned int completion_tag, u32 hop_flags)
+ {
+ 	return false;
+ }
+ 
+ static inline bool airoha_soe_rx_drop(struct airoha_soe *soe,
+-				      unsigned int sa_index)
++				      unsigned int completion_tag)
+ {
+ 	return false;
+ }
+ 
+ static inline bool airoha_soe_rx_plain_skb(struct airoha_gdm_dev *dev,
+ 					   struct sk_buff *skb,
+-					   struct net_device *rx_dev)
++					   struct net_device *rx_dev,
++					   u16 foe_hash, bool foe_valid,
++					   bool foe_unbound)
+ {
+ 	return false;
+ }
+@@ -135,6 +191,80 @@ static inline int airoha_soe_xmit(struct airoha_soe_sa *sa,
+ {
+ 	return -EOPNOTSUPP;
+ }
++
++static inline int
++airoha_soe_ppe_flow_add(struct airoha_soe *soe, struct xfrm_state *x, u8 dir,
++			struct airoha_soe_ppe_flow *flow,
++			struct airoha_soe_ppe_info *info)
++{
++	return -EOPNOTSUPP;
++}
++
++static inline void airoha_soe_ppe_flow_del(struct airoha_soe_ppe_flow *flow)
++{
++}
++
++static inline bool
++airoha_soe_ppe_flow_bind_start(struct airoha_soe_ppe_flow *flow, bool *ready)
++{
++	return false;
++}
++
++static inline bool
++airoha_soe_ppe_flow_bind_ready(struct airoha_soe_ppe_flow *flow)
++{
++	return false;
++}
++
++static inline bool
++airoha_soe_ppe_flow_bind_finish(struct airoha_soe_ppe_flow *flow)
++{
++	return false;
++}
++
++static inline bool
++airoha_soe_ppe_flow_bind_share(struct airoha_soe_ppe_flow *flow,
++			       const struct airoha_soe_ppe_flow *source)
++{
++	return false;
++}
++
++static inline bool
++airoha_soe_ppe_flow_bind_clone(struct airoha_soe_ppe_flow *flow,
++			       const struct airoha_soe_ppe_flow *source)
++{
++	return false;
++}
++
++static inline void
++airoha_soe_ppe_flow_bind_abort(struct airoha_soe_ppe_flow *flow)
++{
++}
++
++static inline void airoha_soe_ppe_flow_unbind(struct airoha_soe_ppe_flow *flow)
++{
++}
++
++static inline void airoha_soe_ppe_flow_restore(struct airoha_soe_ppe_flow *flow)
++{
++}
++
++static inline void
++airoha_soe_ppe_adopt_quiesce(struct airoha_soe *soe, bool quiesced)
++{
++}
++
++static inline struct airoha_soe_ppe_flow *
++airoha_soe_ppe_flow_pop_sa(struct airoha_soe_sa *sa)
++{
++	return NULL;
++}
++
++static inline struct airoha_soe_ppe_flow *
++airoha_soe_ppe_flow_pop_all(struct airoha_soe *soe)
++{
++	return NULL;
++}
+ #endif
+ 
+ #endif /* AIROHA_SOE_H */
+-- 
+2.53.0

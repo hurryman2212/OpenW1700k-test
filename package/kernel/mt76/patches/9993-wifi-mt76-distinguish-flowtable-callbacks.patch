@@ -1,0 +1,87 @@
+From: Jihong Min <hurryman2212@gmail.com>
+Subject: [PATCH] wifi: mt76: distinguish flowtable callbacks
+
+Keep TC flower and Netfilter flowtable callbacks distinguishable when mt76
+forwards rules to the Airoha PPE.
+
+Assisted-by: Codex:gpt-5.6
+Signed-off-by: Jihong Min <hurryman2212@gmail.com>
+---
+diff --git a/npu.c b/npu.c
+--- a/npu.c
++++ b/npu.c
+@@ -298,32 +298,51 @@ int mt76_npu_rx_queue_init(struct mt76_dev *dev, struct mt76_queue *q)
+ 	mutex_unlock(&dev->mutex);
+ 
+ 	return err;
+ }
+ EXPORT_SYMBOL_GPL(mt76_npu_rx_queue_init);
+ 
+-static int mt76_npu_setup_tc_block_cb(enum tc_setup_type type,
+-				      void *type_data, void *cb_priv)
++static int mt76_npu_setup_tc_block_cb_common(enum tc_setup_type type,
++					     void *type_data, void *cb_priv,
++					     bool is_flowtable)
+ {
+ 	struct mt76_phy *phy = cb_priv;
+ 
+ 	if (type != TC_SETUP_CLSFLOWER)
+ 		return -EOPNOTSUPP;
+ 
+ 	if (!mt76_ppe_device_active(phy->dev))
+ 		return -EOPNOTSUPP;
+ 
+-	return airoha_ppe_dev_setup_tc_block_cb(phy->dev->mmio.ppe_dev,
+-						type_data);
++	if (is_flowtable)
++		return airoha_ppe_dev_setup_ft_block_cb(phy->dev->mmio.ppe_dev,
++							type_data);
++
++	return airoha_ppe_dev_setup_tc_block_cb(phy->dev->mmio.ppe_dev,
++						type_data);
+ }
+ 
++static int mt76_npu_setup_tc_block_cb(enum tc_setup_type type,
++				      void *type_data, void *cb_priv)
++{
++	return mt76_npu_setup_tc_block_cb_common(type, type_data, cb_priv, false);
++}
++
++static int mt76_npu_setup_ft_block_cb(enum tc_setup_type type,
++				      void *type_data, void *cb_priv)
++{
++	return mt76_npu_setup_tc_block_cb_common(type, type_data, cb_priv, true);
++}
++
+ static int mt76_npu_setup_tc_block(struct mt76_phy *phy,
+ 				   struct net_device *dev,
+-				   struct flow_block_offload *f)
++				   struct flow_block_offload *f,
++				   bool is_flowtable)
+ {
+-	flow_setup_cb_t *cb = mt76_npu_setup_tc_block_cb;
++	flow_setup_cb_t *cb = is_flowtable ? mt76_npu_setup_ft_block_cb :
++					     mt76_npu_setup_tc_block_cb;
+ 	static LIST_HEAD(block_cb_list);
+ 	struct flow_block_cb *block_cb;
+ 
+ 	if (f->binder_type != FLOW_BLOCK_BINDER_TYPE_CLSACT_INGRESS)
+ 		return -EOPNOTSUPP;
+ 
+@@ -373,14 +392,15 @@ int mt76_npu_net_setup_tc(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+ 
+ 	if (!mt76_npu_device_active(phy->dev))
+ 		return -EOPNOTSUPP;
+ 
+ 	switch (type) {
+ 	case TC_SETUP_BLOCK:
++		return mt76_npu_setup_tc_block(phy, dev, type_data, false);
+ 	case TC_SETUP_FT:
+-		return mt76_npu_setup_tc_block(phy, dev, type_data);
++		return mt76_npu_setup_tc_block(phy, dev, type_data, true);
+ 	default:
+ 		return -EOPNOTSUPP;
+ 	}
+ }
+ EXPORT_SYMBOL_GPL(mt76_npu_net_setup_tc);
+ 

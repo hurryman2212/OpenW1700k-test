@@ -1,0 +1,27 @@
+From d6f449f04d50fc269ff21fc3d4e35c577d61222e Mon Sep 17 00:00:00 2001
+From: Jihong Min <hurryman2212@gmail.com>
+Date: Thu, 23 Jul 2026 01:48:53 +0900
+Subject: [PATCH] net: airoha: build the SOE provider
+
+Add the Secure Offload Engine provider object to the Airoha Ethernet
+driver when its configuration option is enabled.
+
+Assisted-by: Codex:gpt-5.6
+Signed-off-by: Jihong Min <hurryman2212@gmail.com>
+---
+ drivers/net/ethernet/airoha/Makefile | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/drivers/net/ethernet/airoha/Makefile b/drivers/net/ethernet/airoha/Makefile
+index 94468053e34b..b68b8f614b0e 100644
+--- a/drivers/net/ethernet/airoha/Makefile
++++ b/drivers/net/ethernet/airoha/Makefile
+@@ -6,4 +6,5 @@
+ obj-$(CONFIG_NET_AIROHA) += airoha-eth.o
+ airoha-eth-y := airoha_eth.o airoha_ppe.o
+ airoha-eth-$(CONFIG_DEBUG_FS) += airoha_ppe_debugfs.o
++airoha-eth-$(CONFIG_NET_AIROHA_SOE) += airoha_soe.o
+ obj-$(CONFIG_NET_AIROHA_NPU) += airoha_npu.o
+-- 
+2.53.0
+

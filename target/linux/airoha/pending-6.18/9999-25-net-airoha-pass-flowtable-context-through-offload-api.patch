@@ -1,0 +1,58 @@
+From c171f925678839d17bf2705ee8990debc9f5eb25 Mon Sep 17 00:00:00 2001
+From: Jihong Min <hurryman2212@gmail.com>
+Date: Sat, 25 Jul 2026 01:22:41 +0900
+Subject: [PATCH 25/43] net: airoha: pass flowtable context through offload API
+
+Keep TC flower and Netfilter flowtable callbacks distinguishable for
+external PPE clients. This lets providers interpret flowtable cookies
+without treating arbitrary TC cookies as flow tuples.
+
+Assisted-by: Codex:gpt-5.6
+Signed-off-by: Jihong Min <hurryman2212@gmail.com>
+---
+ include/linux/soc/airoha/airoha_offload.h | 16 ++++++++++++++--
+ 1 file changed, 14 insertions(+), 2 deletions(-)
+
+diff --git a/include/linux/soc/airoha/airoha_offload.h b/include/linux/soc/airoha/airoha_offload.h
+index 7589fccfeef6..bdbe7b6d8d6c 100644
+--- a/include/linux/soc/airoha/airoha_offload.h
++++ b/include/linux/soc/airoha/airoha_offload.h
+@@ -18,7 +18,7 @@ enum {
+ struct airoha_ppe_dev {
+ 	struct {
+ 		int (*setup_tc_block_cb)(struct airoha_ppe_dev *dev,
+-					 void *type_data);
++					 void *type_data, bool is_flowtable);
+ 		void (*check_skb)(struct airoha_ppe_dev *dev,
+ 				  struct sk_buff *skb, u16 hash,
+ 				  bool rx_wlan);
+@@ -34,7 +34,13 @@ void airoha_ppe_put_dev(struct airoha_ppe_dev *dev);
+ static inline int airoha_ppe_dev_setup_tc_block_cb(struct airoha_ppe_dev *dev,
+ 						   void *type_data)
+ {
+-	return dev->ops.setup_tc_block_cb(dev, type_data);
++	return dev->ops.setup_tc_block_cb(dev, type_data, false);
++}
++
++static inline int airoha_ppe_dev_setup_ft_block_cb(struct airoha_ppe_dev *dev,
++						   void *type_data)
++{
++	return dev->ops.setup_tc_block_cb(dev, type_data, true);
+ }
+ 
+ static inline void airoha_ppe_dev_check_skb(struct airoha_ppe_dev *dev,
+@@ -59,6 +65,12 @@ static inline int airoha_ppe_dev_setup_tc_block_cb(struct airoha_ppe_dev *dev,
+ 	return -EOPNOTSUPP;
+ }
+ 
++static inline int airoha_ppe_dev_setup_ft_block_cb(struct airoha_ppe_dev *dev,
++						   void *type_data)
++{
++	return -EOPNOTSUPP;
++}
++
+ static inline void airoha_ppe_dev_check_skb(struct airoha_ppe_dev *dev,
+ 					    struct sk_buff *skb, u16 hash,
+ 					    bool rx_wlan)
+-- 
+2.53.0

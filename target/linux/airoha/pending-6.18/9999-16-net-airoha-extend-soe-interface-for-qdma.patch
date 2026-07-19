@@ -1,0 +1,53 @@
+From 7f312e489ec11327a989a362658d4ffa03f30e4a Mon Sep 17 00:00:00 2001
+From: Jihong Min <hurryman2212@gmail.com>
+Date: Thu, 23 Jul 2026 01:46:35 +0900
+Subject: [PATCH] net: airoha: extend the SOE interface for QDMA packets
+
+Expose the receive completion and transmit submission hooks needed
+to carry Secure Offload Engine packets over the Ethernet QDMA rings.
+
+Assisted-by: Codex:gpt-5.6
+Signed-off-by: Jihong Min <hurryman2212@gmail.com>
+
+diff --git a/drivers/net/ethernet/airoha/airoha_soe.h b/drivers/net/ethernet/airoha/airoha_soe.h
+index 5a38af5..97accd2 100644
+--- a/drivers/net/ethernet/airoha/airoha_soe.h
++++ b/drivers/net/ethernet/airoha/airoha_soe.h
+@@ -48,13 +48,14 @@ void airoha_soe_build_netdev(struct net_device *dev,
+ 			     airoha_soe_xmit_skb_t xmit_skb);
+ void airoha_soe_teardown_netdev(struct net_device *dev);
+ int airoha_soe_set_features(struct net_device *dev, netdev_features_t features);
++bool airoha_soe_rx_is_completion(const void *data, size_t len, u32 msg0);
+ bool airoha_soe_rx_skb(struct airoha_soe *soe, struct sk_buff *skb,
+ 		       unsigned int completion_tag, u32 hop_flags);
+ bool airoha_soe_rx_drop(struct airoha_soe *soe,
+ 			unsigned int completion_tag);
+ bool airoha_soe_rx_plain_skb(struct airoha_gdm_dev *dev, struct sk_buff *skb,
+ 			     struct net_device *rx_dev);
+-bool airoha_soe_has_pending_rx(struct airoha_soe *soe);
++bool airoha_soe_has_pending_ctx(struct airoha_soe *soe);
+ int airoha_soe_xmit(struct airoha_soe_sa *sa, struct airoha_gdm_dev *dev,
+ 		    struct sock *sk, struct sk_buff *skb, struct xfrm_state *x);
+ #else
+@@ -97,6 +98,12 @@ static inline int airoha_soe_set_features(struct net_device *dev,
+ 	return 0;
+ }
+ 
++static inline bool airoha_soe_rx_is_completion(const void *data, size_t len,
++					       u32 msg0)
++{
++	return false;
++}
++
+ static inline bool airoha_soe_rx_skb(struct airoha_soe *soe,
+ 				     struct sk_buff *skb,
+ 				     unsigned int sa_index, u32 hop_flags)
+@@ -117,7 +124,7 @@ static inline bool airoha_soe_rx_plain_skb(struct airoha_gdm_dev *dev,
+ 	return false;
+ }
+ 
+-static inline bool airoha_soe_has_pending_rx(struct airoha_soe *soe)
++static inline bool airoha_soe_has_pending_ctx(struct airoha_soe *soe)
+ {
+ 	return false;
+ }

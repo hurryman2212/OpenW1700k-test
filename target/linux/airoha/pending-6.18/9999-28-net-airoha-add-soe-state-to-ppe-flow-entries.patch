@@ -1,0 +1,85 @@
+From 797d856c2e0f935cc1293b2f74d8f3abb2cef766 Mon Sep 17 00:00:00 2001
+From: Jihong Min <hurryman2212@gmail.com>
+Date: Thu, 23 Jul 2026 01:48:28 +0900
+Subject: [PATCH] net: airoha: add SOE state to PPE flow entries
+
+Track SOE binding state in each PPE flow entry and declare the quiesce,
+flush, and deferred binding operations shared by the Ethernet and
+SOE providers.
+
+Assisted-by: Codex:gpt-5.6
+Signed-off-by: Jihong Min <hurryman2212@gmail.com>
+---
+ drivers/net/ethernet/airoha/airoha_eth.h | 24 +++++++++++++++++++++++-
+ 1 file changed, 23 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/net/ethernet/airoha/airoha_eth.h b/drivers/net/ethernet/airoha/airoha_eth.h
+index 5fb23e6a7917..423773ca1c1f 100644
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -16,6 +16,8 @@
+ #include <linux/soc/airoha/airoha_offload.h>
+ #include <net/dsa.h>
+ 
++#include "airoha_soe.h"
++
+ struct airoha_soe;
+ 
+ #define AIROHA_MAX_NUM_GDM_PORTS	4
+@@ -500,6 +502,7 @@ enum airoha_flow_entry_type {
+ 	FLOW_TYPE_L4,
+ 	FLOW_TYPE_L2,
+ 	FLOW_TYPE_L2_SUBFLOW,
++	FLOW_TYPE_SOE_INPUT_OWNER,
+ };
+ 
+ struct airoha_flow_table_entry {
+@@ -519,6 +522,10 @@ struct airoha_flow_table_entry {
+ 
+ 	struct rhash_head node;
+ 	unsigned long cookie;
++	struct list_head soe_bind_node;
++	u32 soe_bind_hash;
++	bool soe_bind_rx_wlan;
++	struct airoha_soe_ppe_flow soe_flow;
+ 
+ 	/* Must be last --ends in a flexible-array member. */
+ 	struct airoha_foe_entry data;
+@@ -621,6 +628,8 @@ struct airoha_ppe {
+ 
+ 	struct hlist_head *foe_flow;
+ 	u16 *foe_check_time;
++	unsigned int soe_quiesce_count;
++	struct list_head soe_bind_pending;
+ 
+ 	struct airoha_foe_stats *foe_stats;
+ 	dma_addr_t foe_stats_dma;
+@@ -749,7 +758,8 @@ void airoha_ppe_set_cpu_port(struct airoha_gdm_dev *dev, u8 ppe_id, u8 fport);
+ bool airoha_ppe_is_enabled(struct airoha_eth *eth, int index);
+ void airoha_ppe_check_skb(struct airoha_ppe_dev *dev, struct sk_buff *skb,
+ 			  u16 hash, bool rx_wlan);
+-int airoha_ppe_setup_tc_block_cb(struct airoha_ppe_dev *dev, void *type_data);
++int airoha_ppe_setup_tc_block_cb(struct airoha_ppe_dev *dev, void *type_data,
++				 bool is_flowtable);
+ int airoha_ppe_init(struct airoha_eth *eth);
+ void airoha_ppe_deinit(struct airoha_eth *eth);
+ void airoha_ppe_init_upd_mem(struct airoha_gdm_dev *dev, const u8 *addr);
+@@ -758,6 +768,18 @@ struct airoha_foe_entry *airoha_ppe_foe_get_entry(struct airoha_ppe *ppe,
+ 						  u32 hash);
+ void airoha_ppe_foe_entry_get_stats(struct airoha_ppe *ppe, u32 hash,
+ 				    struct airoha_foe_stats64 *stats);
++int airoha_ppe_soe_flush_sa(struct airoha_eth *eth,
++			    struct airoha_soe_sa *sa);
++int airoha_ppe_soe_flush_all(struct airoha_eth *eth,
++			     struct airoha_soe *soe);
++void airoha_ppe_soe_forget_sa(struct airoha_eth *eth,
++			      struct airoha_soe_sa *sa);
++bool airoha_ppe_soe_quiesce(struct airoha_eth *eth);
++void airoha_ppe_soe_resume(struct airoha_eth *eth);
++bool airoha_ppe_soe_is_quiesced(struct airoha_eth *eth);
++void airoha_ppe_soe_bind_ready(struct airoha_eth *eth);
++void airoha_ppe_soe_bind_cancel(struct airoha_eth *eth,
++				struct airoha_soe_ppe_flow *flow);
+ 
+ #ifdef CONFIG_DEBUG_FS
+ int airoha_ppe_debugfs_init(struct airoha_ppe *ppe);

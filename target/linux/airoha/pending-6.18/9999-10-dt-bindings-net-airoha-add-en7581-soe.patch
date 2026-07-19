@@ -1,0 +1,65 @@
+From f73b4255f16ea7c570ff48a2b962d01852a53cd4 Mon Sep 17 00:00:00 2001
+From: Jihong Min <hurryman2212@gmail.com>
+Date: Thu, 23 Jul 2026 01:46:03 +0900
+Subject: [PATCH] dt-bindings: net: airoha: add EN7581 SOE
+
+Document the EN7581 Secure Offload Engine register window and interrupt
+used by the Ethernet driver for ESP packet offload.
+
+Assisted-by: Codex:gpt-5.6
+Signed-off-by: Jihong Min <hurryman2212@gmail.com>
+
+diff --git a/Documentation/devicetree/bindings/net/airoha,en7581-soe.yaml b/Documentation/devicetree/bindings/net/airoha,en7581-soe.yaml
+new file mode 100644
+index 0000000..24aecaf
+--- /dev/null
++++ b/Documentation/devicetree/bindings/net/airoha,en7581-soe.yaml
+@@ -0,0 +1,48 @@
++# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
++%YAML 1.2
++---
++$id: http://devicetree.org/schemas/net/airoha,en7581-soe.yaml#
++$schema: http://devicetree.org/meta-schemas/core.yaml#
++
++title: Airoha EN7581 Secure Offload Engine
++
++maintainers:
++  - Lorenzo Bianconi <lorenzo@kernel.org>
++
++description:
++  The Secure Offload Engine provides inline ESP packet offload resources used
++  by the Airoha Ethernet controller.
++
++properties:
++  compatible:
++    const: airoha,en7581-soe
++
++  reg:
++    maxItems: 1
++
++  interrupts:
++    maxItems: 1
++
++required:
++  - compatible
++  - reg
++  - interrupts
++
++additionalProperties: false
++
++examples:
++  - |
++    #include <dt-bindings/interrupt-controller/arm-gic.h>
++    #include <dt-bindings/interrupt-controller/irq.h>
++
++    soc {
++      #address-cells = <2>;
++      #size-cells = <2>;
++
++      soe@1fbfa000 {
++        compatible = "airoha,en7581-soe";
++        reg = <0 0x1fbfa000 0 0x268>;
++        interrupts = <GIC_SPI 79 IRQ_TYPE_LEVEL_HIGH>;
++      };
++    };
++...

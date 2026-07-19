@@ -9,6 +9,7 @@ FEATURES:=dt squashfs nand ramdisk gpio
 KERNEL_PATCHVER:=6.18
 
 include $(INCLUDE_DIR)/target.mk
+KERNEL_FILE_DEPENDS += $(CURDIR)/pending-$(KERNEL_PATCHVER)
 DEFAULT_PACKAGES += \
 	kmod-leds-gpio kmod-gpio-button-hotplug
 

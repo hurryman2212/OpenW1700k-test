@@ -1,0 +1,49 @@
+From 8500e5d690739d7494c9777e86895269b01973a4 Mon Sep 17 00:00:00 2001
+From: Jihong Min <hurryman2212@gmail.com>
+Date: Thu, 23 Jul 2026 03:29:01 +0900
+Subject: [PATCH] net: airoha: compose SOE and OpenWrt feature hooks
+
+Validate SOE ESP feature changes in the existing OpenWrt HW-GRO feature
+callback so both extensions share one ndo_set_features implementation.
+
+Assisted-by: Codex:gpt-5.6
+Signed-off-by: Jihong Min <hurryman2212@gmail.com>
+---
+
+diff --git a/drivers/net/ethernet/airoha/airoha_eth.c b/drivers/net/ethernet/airoha/airoha_eth.c
+index b92cf72..a339bc9 100644
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -3072,6 +3072,11 @@ static int airoha_dev_set_features(struct net_device *netdev,
+ 	struct airoha_gdm_dev *dev = netdev_priv(netdev);
+ 	struct airoha_qdma *qdma = airoha_qdma_deref(dev);
+ 	int qdma_id = qdma - &dev->eth->qdma[0];
++	int err;
++
++	err = airoha_soe_set_features(netdev, features);
++	if (err)
++		return err;
+ 
+ 	if (!(diff & NETIF_F_GRO_HW))
+ 		return 0;
+@@ -4273,12 +4278,6 @@ static int airoha_dev_tc_setup(struct net_device *dev,
+ 	}
+ }
+ 
+-static int airoha_dev_set_features(struct net_device *netdev,
+-				   netdev_features_t features)
+-{
+-	return airoha_soe_set_features(netdev, features);
+-}
+-
+ static const struct net_device_ops airoha_netdev_ops = {
+ 	.ndo_init		= airoha_dev_init,
+ 	.ndo_open		= airoha_dev_open,
+@@ -4290,7 +4289,6 @@ static const struct net_device_ops airoha_netdev_ops = {
+ 	.ndo_start_xmit		= airoha_dev_xmit,
+ 	.ndo_get_stats64        = airoha_dev_get_stats64,
+ 	.ndo_set_mac_address	= airoha_dev_set_macaddr,
+-	.ndo_set_features	= airoha_dev_set_features,
+ 	.ndo_setup_tc		= airoha_dev_tc_setup,
+ };
+ 

@@ -1,0 +1,39 @@
+From 96646b189a3a05889b3fc0dc22690e0c58003f33 Mon Sep 17 00:00:00 2001
+From: Jihong Min <hurryman2212@gmail.com>
+Date: Thu, 23 Jul 2026 01:48:53 +0900
+Subject: [PATCH] net: airoha: add the SOE offload option
+
+Add a configuration option for the EN7581 Secure Offload Engine ESP
+packet-offload provider and select the required XFRM infrastructure.
+
+Assisted-by: Codex:gpt-5.6
+Signed-off-by: Jihong Min <hurryman2212@gmail.com>
+---
+ drivers/net/ethernet/airoha/Kconfig | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/drivers/net/ethernet/airoha/Kconfig b/drivers/net/ethernet/airoha/Kconfig
+index 789906516bf8..f5279dc017ef 100644
+--- a/drivers/net/ethernet/airoha/Kconfig
++++ b/drivers/net/ethernet/airoha/Kconfig
+@@ -32,4 +32,17 @@ config NET_AIROHA_FLOW_STATS
+ 	help
+ 	  Enable Airoha flowtable statistic counters.
+ 
++config NET_AIROHA_SOE
++	bool "Airoha SOE ESP offload support"
++	depends on NET_AIROHA
++	depends on INET
++	select XFRM
++	select XFRM_OFFLOAD
++	help
++	  Enable support for the Airoha Secure Offload Engine used by
++	  the Ethernet driver for ESP packet offload. This option only
++	  adds the provider and netdev plumbing; ESP offload is still
++	  advertised at runtime only when the SOE block and required
++	  packet offload path are available.
++
+ endif #NET_VENDOR_AIROHA
+-- 
+2.53.0
+

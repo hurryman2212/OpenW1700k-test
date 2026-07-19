@@ -1,0 +1,77 @@
+From e91c1ad92073ba1d1cc99ceaaee7e77c04abc557 Mon Sep 17 00:00:00 2001
+From: Jihong Min <hurryman2212@gmail.com>
+Date: Thu, 23 Jul 2026 01:46:23 +0900
+Subject: [PATCH] net: airoha: add SOE driver state
+
+Add the shared Ethernet driver state used to own the EN7581 Secure
+Offload Engine and its QDMA resources.
+
+Assisted-by: Codex:gpt-5.6
+Signed-off-by: Jihong Min <hurryman2212@gmail.com>
+---
+ drivers/net/ethernet/airoha/airoha_eth.h | 20 ++++++++++++++++++++
+ 1 file changed, 20 insertions(+)
+
+diff --git a/drivers/net/ethernet/airoha/airoha_eth.h b/drivers/net/ethernet/airoha/airoha_eth.h
+index f6d01a8e8da1..fb34b6c6023f 100644
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -16,6 +16,8 @@
+ #include <linux/soc/airoha/airoha_offload.h>
+ #include <net/dsa.h>
+ 
++struct airoha_soe;
++
+ #define AIROHA_MAX_NUM_GDM_PORTS	4
+ #define AIROHA_MAX_NUM_GDM_DEVS		2
+ #define AIROHA_MAX_NUM_QDMA		2
+@@ -218,10 +220,18 @@ struct airoha_queue {
+ 	int buf_size;
+ 	bool txq_stopped;
+ 	bool flushing;
++	bool rx_coherent;
++	bool rx_drop_chain;
++	void *rx_coherent_buf;
++	dma_addr_t rx_coherent_dma;
+ 
+ 	struct napi_struct napi;
+ 	struct page_pool *page_pool;
+ 	struct sk_buff *skb;
++	/* First SOE descriptor metadata is kept while a scattered frame is built. */
++	int rx_frame_descs;
++	u32 soe_rx_msg0;
++	u32 soe_rx_msg2;
+ 
+ 	struct list_head tx_list;
+ };
+@@ -574,6 +584,11 @@ struct airoha_gdm_dev {
+ 
+ 	u32 flags;
+ 	int nbq;
++	/* Prevent toggling NETIF_F_HW_ESP while programmed SAs still exist. */
++	atomic_t soe_xfrm_state_count;
++	/* Private SOE submit path into this GDM's active QDMA instance. */
++	int (*soe_xmit_skb)(struct airoha_gdm_dev *dev, struct sk_buff *skb,
++			    u32 msg0, u32 msg1, u32 msg2);
+ 
+ 	struct airoha_hw_stats stats;
+ 
+@@ -646,6 +661,9 @@ struct airoha_eth {
+ 
+ 	struct airoha_qdma qdma[AIROHA_MAX_NUM_QDMA];
+ 	struct airoha_gdm_port *ports[AIROHA_MAX_NUM_GDM_PORTS];
++	struct airoha_soe *soe;
++	bool soe_present;
++	bool natt_ifc_ready;
+ };
+ 
+ u32 airoha_rr(void __iomem *base, u32 offset);
+@@ -713,6 +731,8 @@ static inline bool airoha_is_7583(struct airoha_eth *eth)
+ int airoha_get_fe_port(struct airoha_gdm_dev *dev);
+ bool airoha_is_valid_gdm_dev(struct airoha_eth *eth,
+ 			     struct airoha_gdm_dev *dev);
++int airoha_qdma_xmit_skb(struct airoha_gdm_dev *dev, struct sk_buff *skb,
++			 u32 msg0, u32 msg1, u32 msg2);
+ 
+ extern struct mutex flow_offload_mutex;
+ 

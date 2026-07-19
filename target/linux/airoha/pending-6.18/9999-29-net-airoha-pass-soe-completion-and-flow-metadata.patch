@@ -1,0 +1,116 @@
+From 00fb0987f737082281cf8154ef12de7e8375c877 Mon Sep 17 00:00:00 2001
+From: Jihong Min <hurryman2212@gmail.com>
+Date: Thu, 23 Jul 2026 01:48:28 +0900
+Subject: [PATCH] net: airoha: pass SOE completion and flow metadata
+
+Pass completion tags and learned FOE identifiers to the SOE provider and
+distinguish Ethernet flowtable callbacks from ordinary TC flower rules.
+
+Assisted-by: Codex:gpt-5.6
+Signed-off-by: Jihong Min <hurryman2212@gmail.com>
+
+diff --git a/drivers/net/ethernet/airoha/airoha_eth.c b/drivers/net/ethernet/airoha/airoha_eth.c
+index fdc7b37..b92cf72 100644
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -1372,11 +1372,12 @@ static int airoha_qdma_rx_process(struct airoha_queue *q, int budget,
+ 		if (soe_pkt) {
+ 			u32 hop_flags = FIELD_GET(QDMA_ETH_RXMSG_HOP_FLAGS_MASK,
+ 						  q->soe_rx_msg0);
+-			u32 sa_index = FIELD_GET(QDMA_ETH_RXMSG_SW_UDF_MASK,
+-						 q->soe_rx_msg2);
++			u32 completion_tag =
++				FIELD_GET(QDMA_ETH_RXMSG_SW_UDF_MASK,
++					  q->soe_rx_msg2);
+ 
+ 			done++;
+-			if (!airoha_soe_rx_skb(eth->soe, q->skb, sa_index,
++			if (!airoha_soe_rx_skb(eth->soe, q->skb, completion_tag,
+ 					       hop_flags))
+ 				dev_kfree_skb(q->skb);
+ 			q->skb = NULL;
+@@ -1431,7 +1432,9 @@ static int airoha_qdma_rx_process(struct airoha_queue *q, int budget,
+ 		 * If one matches an inbound packet-offload SA, consume it here
+ 		 * and resubmit it to SOE before GRO takes ownership.
+ 		 */
+-		if (airoha_soe_rx_plain_skb(dev, q->skb, rx_dev)) {
++		if (airoha_soe_rx_plain_skb(dev, q->skb, rx_dev, hash,
++					    hash != AIROHA_RXD4_FOE_ENTRY,
++					    reason == PPE_CPU_REASON_HIT_UNBIND_RATE_REACHED)) {
+ 			q->skb = NULL;
+ 			continue;
+ 		}
+@@ -1443,10 +1446,10 @@ static int airoha_qdma_rx_process(struct airoha_queue *q, int budget,
+ #if IS_REACHABLE(CONFIG_NET_AIROHA_SOE)
+ 		if (soe_pkt) {
+ 			u32 soe_msg2 = first_buf ? msg2 : q->soe_rx_msg2;
+-			u32 sa_index =
++			u32 completion_tag =
+ 				FIELD_GET(QDMA_ETH_RXMSG_SW_UDF_MASK, soe_msg2);
+ 
+-			airoha_soe_rx_drop(eth->soe, sa_index);
++			airoha_soe_rx_drop(eth->soe, completion_tag);
+ 		}
+ #endif
+ 		q->rx_drop_chain = !!FIELD_GET(QDMA_DESC_MORE_MASK, desc_ctrl);
+@@ -3989,8 +3992,9 @@ static int airoha_dev_tc_matchall(struct net_device *netdev,
+ 	}
+ }
+ 
+-static int airoha_dev_setup_tc_block_cb(enum tc_setup_type type,
+-					void *type_data, void *cb_priv)
++static int airoha_dev_setup_tc_block_cb_common(enum tc_setup_type type,
++					       void *type_data, void *cb_priv,
++					       bool is_flowtable)
+ {
+ 	struct net_device *netdev = cb_priv;
+ 	struct airoha_gdm_dev *dev = netdev_priv(netdev);
+@@ -4001,7 +4005,8 @@ static int airoha_dev_setup_tc_block_cb(enum tc_setup_type type,
+ 
+ 	switch (type) {
+ 	case TC_SETUP_CLSFLOWER:
+-		return airoha_ppe_setup_tc_block_cb(&eth->ppe->dev, type_data);
++		return airoha_ppe_setup_tc_block_cb(&eth->ppe->dev, type_data,
++						     is_flowtable);
+ 	case TC_SETUP_CLSMATCHALL:
+ 		return airoha_dev_tc_matchall(netdev, type_data);
+ 	default:
+@@ -4009,10 +4014,25 @@ static int airoha_dev_setup_tc_block_cb(enum tc_setup_type type,
+ 	}
+ }
+ 
++static int airoha_dev_setup_tc_block_cb(enum tc_setup_type type,
++					void *type_data, void *cb_priv)
++{
++	return airoha_dev_setup_tc_block_cb_common(type, type_data, cb_priv,
++						     false);
++}
++
++static int airoha_dev_setup_ft_block_cb(enum tc_setup_type type,
++					void *type_data, void *cb_priv)
++{
++	return airoha_dev_setup_tc_block_cb_common(type, type_data, cb_priv, true);
++}
++
+ static int airoha_dev_setup_tc_block(struct net_device *dev,
+-				     struct flow_block_offload *f)
++				     struct flow_block_offload *f,
++				     bool is_flowtable)
+ {
+-	flow_setup_cb_t *cb = airoha_dev_setup_tc_block_cb;
++	flow_setup_cb_t *cb = is_flowtable ? airoha_dev_setup_ft_block_cb :
++					     airoha_dev_setup_tc_block_cb;
+ 	static LIST_HEAD(block_cb_list);
+ 	struct flow_block_cb *block_cb;
+ 
+@@ -4245,8 +4265,9 @@ static int airoha_dev_tc_setup(struct net_device *dev,
+ 	case TC_SETUP_QDISC_HTB:
+ 		return airoha_tc_setup_qdisc_htb(dev, type_data);
+ 	case TC_SETUP_BLOCK:
++		return airoha_dev_setup_tc_block(dev, type_data, false);
+ 	case TC_SETUP_FT:
+-		return airoha_dev_setup_tc_block(dev, type_data);
++		return airoha_dev_setup_tc_block(dev, type_data, true);
+ 	default:
+ 		return -EOPNOTSUPP;
+ 	}

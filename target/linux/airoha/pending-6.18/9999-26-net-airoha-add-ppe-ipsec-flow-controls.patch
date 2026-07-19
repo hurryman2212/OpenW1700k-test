@@ -1,0 +1,28 @@
+From 1bf4a48b9c40f06e2cb321799b563283b8424f7d Mon Sep 17 00:00:00 2001
+From: Jihong Min <hurryman2212@gmail.com>
+Date: Thu, 23 Jul 2026 01:48:28 +0900
+Subject: [PATCH 26/43] net: airoha: add PPE IPsec flow controls
+
+Define the PPE control bit used for IPv4 IPsec flow processing and
+document the completion tag carried in the QDMA software field.
+
+Assisted-by: Codex:gpt-5.6
+Signed-off-by: Jihong Min <hurryman2212@gmail.com>
+---
+ drivers/net/ethernet/airoha/airoha_regs.h | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/drivers/net/ethernet/airoha/airoha_regs.h b/drivers/net/ethernet/airoha/airoha_regs.h
+index 1cd0ac483b7d..eac216052206 100644
+--- a/drivers/net/ethernet/airoha/airoha_regs.h
++++ b/drivers/net/ethernet/airoha/airoha_regs.h
+@@ -301,6 +301,7 @@
+ #define PPE_GLO_CFG_EN_MASK			BIT(0)
+ 
+ #define REG_PPE_PPE_FLOW_CFG(_n)		(((_n) ? PPE2_BASE : PPE1_BASE) + 0x204)
++#define PPE_FLOW_CFG_IP4_IPSEC_MASK		BIT(27)
+ #define PPE_FLOW_CFG_IP6_HASH_GRE_KEY_MASK	BIT(20)
+ #define PPE_FLOW_CFG_IP4_HASH_GRE_KEY_MASK	BIT(19)
+ #define PPE_FLOW_CFG_IP4_HASH_FLOW_LABEL_MASK	BIT(18)
+-- 
+2.53.0

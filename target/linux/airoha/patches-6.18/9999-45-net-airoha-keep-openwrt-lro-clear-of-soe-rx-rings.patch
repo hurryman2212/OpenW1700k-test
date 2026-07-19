@@ -1,0 +1,33 @@
+From 8ff2a7df287033cbc45443eb51c24c8cb5af9400 Mon Sep 17 00:00:00 2001
+From: Jihong Min <hurryman2212@gmail.com>
+Date: Thu, 23 Jul 2026 03:29:01 +0900
+Subject: [PATCH] net: airoha: keep OpenWrt LRO clear of SOE RX rings
+
+OpenWrt assigns LRO queues from its downstream RX queue mask. When SOE
+reserves low RX rings for completions, keep LRO on the high rings so the
+two receive paths cannot overlap.
+
+Assisted-by: Codex:gpt-5.6
+Signed-off-by: Jihong Min <hurryman2212@gmail.com>
+---
+ drivers/net/ethernet/airoha/airoha_eth.h | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/drivers/net/ethernet/airoha/airoha_eth.h b/drivers/net/ethernet/airoha/airoha_eth.h
+index 4c5d8db..e81b39d 100644
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -734,6 +734,10 @@ static inline bool airoha_qdma_is_lro_queue(struct airoha_queue *q)
+ 	BUILD_BUG_ON(hweight32(AIROHA_RXQ_LRO_EN_MASK) >
+ 		     AIROHA_MAX_NUM_LRO_QUEUES);
+ 
++	/* SOE completions can use low RX rings; keep LRO on high rings. */
++	if (qdma->eth->soe_present)
++		return qid >= AIROHA_NUM_RX_RING - AIROHA_MAX_NUM_LRO_QUEUES;
++
+ 	return !!(AIROHA_RXQ_LRO_EN_MASK & BIT(qid));
+ }
+ 
+-- 
+2.53.0
+
