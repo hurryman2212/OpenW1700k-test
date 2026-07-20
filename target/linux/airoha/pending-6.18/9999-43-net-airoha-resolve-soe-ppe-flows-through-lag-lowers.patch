@@ -1,0 +1,80 @@
+From b53aa0563ae3912fd94d1214576e24a47117961e Mon Sep 17 00:00:00 2001
+From: Jihong Min <hurryman2212@gmail.com>
+Date: Thu, 23 Jul 2026 01:49:26 +0900
+Subject: [PATCH] net: airoha: resolve SOE PPE flows through LAG lowers
+
+Resolve the SOE provider and state handle through the lower device
+selected by the LAG owner when programming PPE XFRM flow actions.
+
+Assisted-by: Codex:gpt-5.6
+Signed-off-by: Jihong Min <hurryman2212@gmail.com>
+---
+ drivers/net/ethernet/airoha/airoha_ppe.c | 19 +++++++++++++++----
+ 1 file changed, 15 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/net/ethernet/airoha/airoha_ppe.c b/drivers/net/ethernet/airoha/airoha_ppe.c
+index 524fef26addb..2bb2c7a105c2 100644
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -43,6 +43,7 @@ struct airoha_ppe_soe_info {
+ 	struct airoha_soe_ppe_info state;
+ 	u32 tunnel_mtu;
+ 	bool input;
++	bool gdm4_return;
+ };
+ 
+ static const struct rhashtable_params airoha_flow_table_params = {
+@@ -731,6 +732,7 @@ airoha_ppe_soe_tuple_xfrm(const struct flow_offload_tuple *tuple, u8 *dir)
+ static int
+ airoha_ppe_soe_flow_add(struct airoha_eth *eth,
+ 			const struct flow_offload_tuple *tuple,
++			struct net_device *lower_dev,
+ 			struct airoha_flow_table_entry *e,
+ 			struct airoha_ppe_soe_info *info,
+ 			const struct flow_action_entry *xfrm_act)
+@@ -762,12 +764,14 @@ airoha_ppe_soe_flow_add(struct airoha_eth *eth,
+ 	if (tuple->l3proto != NFPROTO_IPV4 || x->props.family != AF_INET)
+ 		return -EOPNOTSUPP;
+ 
+-	err = airoha_soe_ppe_flow_add(eth->soe, x, dir,
++	err = airoha_soe_ppe_flow_add(eth->soe, x, lower_dev, dir,
+ 				      &e->soe_flow, &info->state);
+ 	if (err)
+ 		return err;
+ 
+ 	info->input = dir == XFRM_DEV_OFFLOAD_IN;
++	info->gdm4_return = info->input && (netif_is_lag_port(lower_dev) ||
++					    netif_is_lag_master(lower_dev));
+ 	info->tunnel_mtu = tuple->mtu ? tuple->mtu :
+ 					      AIROHA_PPE_SOE_DEFAULT_TUNNEL_MTU;
+ 
+@@ -1797,9 +1801,16 @@ airoha_ppe_foe_flow_commit_soe_in(struct airoha_ppe *ppe,
+ 	entry.ipv4.data = e->data.ipv4.data;
+ 	memcpy(&entry.ipv4.l2, &e->data.ipv4.l2,
+ 	       sizeof(entry.ipv4.l2));
+-	if (FIELD_GET(AIROHA_FOE_IB2_PSE_PORT, entry.ipv4.ib2) ==
+-	    FE_PSE_PORT_GDM4)
++	if (info->gdm4_return ||
++	    FIELD_GET(AIROHA_FOE_IB2_PSE_PORT, entry.ipv4.ib2) ==
++		    FE_PSE_PORT_GDM4) {
+ 		entry.ipv4.l2.common.etype = AIROHA_PPE_SOE_MAGIC_GDM4;
++		entry.ipv4.data &= ~AIROHA_FOE_CHANNEL;
++		entry.ipv4.ib2 &= ~AIROHA_FOE_IB2_PSE_PORT;
++		entry.ipv4.ib2 |=
++			FIELD_PREP(AIROHA_FOE_IB2_PSE_PORT, FE_PSE_PORT_GDM4) |
++			AIROHA_FOE_IB2_FAST_PATH;
++	}
+ 	if (FIELD_GET(AIROHA_FOE_IB1_BIND_PACKET_TYPE, entry.ib1) ==
+ 	    PPE_PKT_TYPE_IPV4_HNAPT)
+ 		memcpy(&entry.ipv4.new_tuple, &entry.ipv4.orig_tuple,
+@@ -2167,7 +2178,7 @@ static int airoha_ppe_flow_offload_replace(struct airoha_eth *eth,
+ 	}
+ 	e->hash = 0xffff;
+ 	e->cookie = f->cookie;
+-	soe_flow = airoha_ppe_soe_flow_add(eth, tuple, e, &soe_info,
++	soe_flow = airoha_ppe_soe_flow_add(eth, tuple, odev, e, &soe_info,
+ 					   xfrm_act);
+ 	if (soe_flow < 0) {
+ 		err = soe_flow;
+-- 
+2.53.0

@@ -1,0 +1,90 @@
+From 622272c73aa884c10d5734986ecec7ed1720c596 Mon Sep 17 00:00:00 2001
+From: Jihong Min <hurryman2212@gmail.com>
+Date: Tue, 21 Jul 2026 04:45:25 +0900
+Subject: [PATCH] xfrm: add lower-device offload state helpers
+
+Store the lower-device XFRM callbacks captured by an upper owner. Add
+helpers to resolve the state handle for a selected lower and to report
+the actual transmit device index.
+
+Assisted-by: Codex:gpt-5.6
+Signed-off-by: Jihong Min <hurryman2212@gmail.com>
+---
+ include/net/xfrm.h | 47 ++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 47 insertions(+)
+
+diff --git a/include/net/xfrm.h b/include/net/xfrm.h
+index 384dc7359aac..b33ab69bd4c1 100644
+--- a/include/net/xfrm.h
++++ b/include/net/xfrm.h
+@@ -165,6 +165,8 @@ struct xfrm_dev_offload {
+ 	 * is held.
+ 	 */
+ 	struct net_device	*real_dev;
++	/* Lower-device callbacks captured by an upper offload owner. */
++	const struct xfrmdev_ops	*real_ops;
+ 	unsigned long		offload_handle;
+ 	/* Snapshot the attached device index for dump paths. */
+ 	int			ifindex;
+@@ -2135,6 +2137,40 @@ void xfrm_dev_state_free(struct xfrm_state *x);
+ 
+ void xfrm_dev_state_advance_esn(struct xfrm_state *x);
+ 
++static inline unsigned long
++xfrm_dev_state_lower_handle(struct xfrm_state *x, struct net_device *lower_dev)
++{
++	const struct xfrmdev_ops *ops;
++	struct xfrm_dev_offload *xso = &x->xso;
++	struct net_device *real_dev = READ_ONCE(xso->real_dev);
++	struct net_device *dev = READ_ONCE(xso->dev);
++	unsigned long handle = READ_ONCE(xso->offload_handle);
++
++	if (!dev || !lower_dev)
++		return 0;
++
++	if ((dev == lower_dev || real_dev == lower_dev) && handle)
++		return handle;
++
++	ops = READ_ONCE(xso->state_ops);
++	if (ops && ops->xdo_dev_state_lower_handle)
++		return ops->xdo_dev_state_lower_handle(dev, x, lower_dev);
++
++	return 0;
++}
++
++static inline int xfrm_dev_state_xmit_ifindex(struct xfrm_state *x)
++{
++	struct xfrm_dev_offload *xso = &x->xso;
++	struct net_device *real_dev = READ_ONCE(xso->real_dev);
++	struct net_device *dev = READ_ONCE(xso->dev);
++
++	if (real_dev)
++		return real_dev->ifindex;
++
++	return dev ? dev->ifindex : 0;
++}
++
+ static inline bool xfrm_dst_offload_ok(struct dst_entry *dst)
+ {
+ 	struct xfrm_state *x = dst->xfrm;
+@@ -2188,6 +2224,17 @@ static inline void xfrm_dev_resume(struct sk_buff *skb)
+ {
+ }
+ 
++static inline unsigned long
++xfrm_dev_state_lower_handle(struct xfrm_state *x, struct net_device *lower_dev)
++{
++	return 0;
++}
++
++static inline int xfrm_dev_state_xmit_ifindex(struct xfrm_state *x)
++{
++	return 0;
++}
++
+ static inline void xfrm_dev_backlog(struct softnet_data *sd)
+ {
+ }
+-- 
+2.53.0
+

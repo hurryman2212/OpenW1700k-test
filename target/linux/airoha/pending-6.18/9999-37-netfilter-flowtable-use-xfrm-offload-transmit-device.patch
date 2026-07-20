@@ -1,0 +1,38 @@
+From 2be497f47ef10f47cc8b399a98e087b443d7c552 Mon Sep 17 00:00:00 2001
+From: Jihong Min <hurryman2212@gmail.com>
+Date: Tue, 21 Jul 2026 04:45:25 +0900
+Subject: [PATCH] netfilter: flowtable: use XFRM offload transmit device
+
+For XFRM flowtable routes, redirect to the lower device selected by
+the offload owner instead of the upper route device. Reject routes
+whose offload state has no usable transmit device.
+
+Assisted-by: Codex:gpt-5.6
+Signed-off-by: Jihong Min <hurryman2212@gmail.com>
+---
+ net/netfilter/nf_flow_table_offload.c | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/net/netfilter/nf_flow_table_offload.c b/net/netfilter/nf_flow_table_offload.c
+index e587ab8cf043..90bfa04f8f80 100644
+--- a/net/netfilter/nf_flow_table_offload.c
++++ b/net/netfilter/nf_flow_table_offload.c
+@@ -709,10 +709,13 @@ static int flow_offload_redirect(struct net *net,
+ 		break;
+ 	case FLOW_OFFLOAD_XMIT_XFRM: {
+ 		struct dst_entry *dst = flow_offload_xfrm_path(this_tuple);
++		struct xfrm_state *x = dst_xfrm(this_tuple->dst_cache);
+ 
+-		if (!dst || !dst->dev)
++		if (!dst || !dst->dev || !x)
++			return -EOPNOTSUPP;
++		ifindex = xfrm_dev_state_xmit_ifindex(x);
++		if (!ifindex)
+ 			return -EOPNOTSUPP;
+-		ifindex = dst->dev->ifindex;
+ 		break;
+ 	}
+ 	case FLOW_OFFLOAD_XMIT_NEIGH:
+-- 
+2.53.0
+
