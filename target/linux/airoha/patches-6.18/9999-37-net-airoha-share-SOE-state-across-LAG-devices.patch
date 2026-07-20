@@ -1,0 +1,226 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jihong Min <hurryman2212@gmail.com>
+Date: Tue, 4 Aug 2026 16:29:39 +0900
+Subject: [PATCH] net: airoha: share SOE state across LAG devices
+
+Share EN7581 SOE state and ownership across supported bond lower devices.
+
+Assisted-by: Codex:gpt-5.6
+Signed-off-by: Jihong Min <hurryman2212@gmail.com>
+---
+ drivers/net/ethernet/airoha/airoha_soe.c | 80 ++++++++++++++++++------
+ 1 file changed, 62 insertions(+), 18 deletions(-)
+
+diff --git a/drivers/net/ethernet/airoha/airoha_soe.c b/drivers/net/ethernet/airoha/airoha_soe.c
+index 4f78c4d..3cea7ee 100644
+--- a/drivers/net/ethernet/airoha/airoha_soe.c
++++ b/drivers/net/ethernet/airoha/airoha_soe.c
+@@ -310,6 +310,7 @@ struct airoha_soe {
+ 	atomic_t seq_pending;
+ 	atomic_t queued_ctx;
+ 	atomic_t active_ctx;
++	atomic_t xfrm_state_count;
+ 
+ 	spinlock_t state_lock; /* Protects dead against concurrent users. */
+ 	/* Protects CPU submission, PPE binding and sequence quiesce/restart. */
+@@ -448,15 +449,16 @@ static void airoha_soe_mark_sa_dead(struct airoha_soe_sa *sa)
+ }
+ 
+ int airoha_soe_ppe_flow_add(struct airoha_soe *soe, struct xfrm_state *x,
+-			    u8 dir, struct airoha_soe_ppe_flow *flow,
++			    struct net_device *lower_dev, u8 dir,
++			    struct airoha_soe_ppe_flow *flow,
+ 			    struct airoha_soe_ppe_info *info)
+ {
+-	const struct xfrmdev_ops *ops;
+ 	struct airoha_soe_xfrm_state *state;
+ 	struct airoha_soe_sa *sa;
++	unsigned long handle;
+ 	int err = -EOPNOTSUPP;
+ 
+-	if (!soe || !x || !flow || !info || flow->soe || flow->sa ||
++	if (!soe || !x || !lower_dev || !flow || !info || flow->soe || flow->sa ||
+ 	    !list_empty(&flow->sa_node) || !list_empty(&flow->soe_node))
+ 		return -EINVAL;
+ 	if (!airoha_soe_ppe_available(soe))
+@@ -465,17 +467,15 @@ int airoha_soe_ppe_flow_add(struct airoha_soe *soe, struct xfrm_state *x,
+ 		return -ENOENT;
+ 
+ 	spin_lock_bh(&x->lock);
+-	ops = READ_ONCE(x->xso.state_ops);
+ 	if (x->km.state != XFRM_STATE_VALID ||
+-	    (ops != &airoha_soe_xfrmdev_ops &&
+-	     ops != &airoha_soe_dsa_xfrmdev_ops) ||
+ 	    x->xso.type != XFRM_DEV_OFFLOAD_PACKET || x->xso.dir != dir ||
+ 	    x->mark.v || x->mark.m || x->props.smark.v ||
+ 	    x->props.smark.m || x->if_id || x->security || x->coaddr ||
+ 	    x->tunnel)
+ 		goto unlock_state;
+ 
+-	state = (struct airoha_soe_xfrm_state *)x->xso.offload_handle;
++	handle = xfrm_dev_state_lower_handle(x, lower_dev);
++	state = (struct airoha_soe_xfrm_state *)handle;
+ 	if (!state || state->soe != soe || !state->sa)
+ 		goto unlock_state;
+ 
+@@ -2691,13 +2691,13 @@ bool airoha_soe_rx_plain_skb(struct airoha_gdm_dev *dev, struct sk_buff *skb,
+ 			     struct net_device *rx_dev, u16 foe_hash,
+ 			     bool foe_valid, bool foe_unbound)
+ {
+-	const struct xfrmdev_ops *ops;
+ 	struct airoha_soe_xfrm_state *state;
+ 	struct airoha_soe_rx_info info = {};
+ 	struct airoha_soe_sa *sa;
+ 	struct airoha_soe_ctx *ctx;
+ 	struct sec_path *sp;
+ 	xfrm_address_t daddr = {};
++	unsigned long handle;
+ 	struct xfrm_state *x;
+ 	int err;
+ 
+@@ -2708,7 +2708,7 @@ bool airoha_soe_rx_plain_skb(struct airoha_gdm_dev *dev, struct sk_buff *skb,
+ 	    !(rx_dev->features & NETIF_F_HW_ESP))
+ 		return false;
+ 
+-	if (!atomic_read(&dev->soe_xfrm_state_count))
++	if (!atomic_read(&dev->eth->soe->xfrm_state_count))
+ 		return false;
+ 	/* Bound PPE entries can still punt keepalive and exception packets to the
+ 	 * CPU. Let normal software XFRM handle them without attempting to learn
+@@ -2734,12 +2734,9 @@ bool airoha_soe_rx_plain_skb(struct airoha_gdm_dev *dev, struct sk_buff *skb,
+ 	}
+ 
+ 	spin_lock(&x->lock);
+-	ops = READ_ONCE(x->xso.state_ops);
+ 	if (x->km.state != XFRM_STATE_VALID ||
+-	    (ops != &airoha_soe_xfrmdev_ops &&
+-	     ops != &airoha_soe_dsa_xfrmdev_ops) ||
+ 	    x->xso.dir != XFRM_DEV_OFFLOAD_IN ||
+-	    x->xso.type != XFRM_DEV_OFFLOAD_PACKET || x->xso.dev != rx_dev)
++	    x->xso.type != XFRM_DEV_OFFLOAD_PACKET)
+ 		goto unlock_state;
+ 	if ((info.encap &&
+ 	     (!x->encap || x->encap->encap_type != UDP_ENCAP_ESPINUDP)) ||
+@@ -2749,8 +2746,9 @@ bool airoha_soe_rx_plain_skb(struct airoha_gdm_dev *dev, struct sk_buff *skb,
+ 	if (info.encap && info.dport != x->encap->encap_dport)
+ 		goto unlock_state;
+ 
+-	state = (struct airoha_soe_xfrm_state *)x->xso.offload_handle;
+-	if (!state || state->dev != dev || !state->sa)
++	handle = xfrm_dev_state_lower_handle(x, rx_dev);
++	state = (struct airoha_soe_xfrm_state *)handle;
++	if (!state || !state->dev || state->dev->eth != dev->eth || !state->sa)
+ 		goto unlock_state;
+ 
+ 	err = xfrm_state_check_expire(x);
+@@ -2928,7 +2926,7 @@ static bool airoha_soe_complete_in(struct sk_buff *skb,
+ 		bool disable_ppe = false;
+ 
+ 		state = (struct airoha_soe_xfrm_state *)
+-			x->xso.offload_handle;
++			xfrm_dev_state_lower_handle(x, ctx->rx.dev);
+ 		if (state && state->sa) {
+ 			spin_lock_bh(&state->sa->lock);
+ 			if (!state->sa->ppe_disabled) {
+@@ -3250,6 +3248,7 @@ static int airoha_soe_xfrm_state_add(struct net_device *dev,
+ 		x->xso.flags |= XFRM_DEV_OFFLOAD_FLAG_FLOWTABLE_INPUT;
+ 
+ 	atomic_inc(&gdm_dev->soe_xfrm_state_count);
++	atomic_inc(&soe->xfrm_state_count);
+ 	state->counted = true;
+ out:
+ 	x->xso.offload_handle = (unsigned long)state;
+@@ -3320,8 +3319,10 @@ static void airoha_soe_xfrm_state_free(struct net_device *dev,
+ 		state->ppe_flush_quiesced = false;
+ 		airoha_soe_free_sa(state->sa);
+ 	}
+-	if (state->counted)
++	if (state->counted) {
+ 		atomic_dec(&state->dev->soe_xfrm_state_count);
++		atomic_dec(&state->soe->xfrm_state_count);
++	}
+ 	dev_put(state->netdev);
+ 	airoha_soe_put_ref(state->soe);
+ 	kfree(state);
+@@ -3397,9 +3398,11 @@ static int airoha_soe_xfrm_packet_xmit(struct sock *sk, struct sk_buff *skb,
+ {
+ 	struct airoha_soe_xfrm_state *state;
+ 	struct net_device *netdev;
++	unsigned long handle;
+ 	int err = -EHOSTUNREACH;
+ 
+-	state = (struct airoha_soe_xfrm_state *)x->xso.offload_handle;
++	handle = xfrm_dev_state_lower_handle(x, skb->dev);
++	state = (struct airoha_soe_xfrm_state *)handle;
+ 	if (!state || !state->sa || !state->dev)
+ 		goto drop;
+ 
+@@ -3553,6 +3556,40 @@ static int airoha_soe_dsa_xfrm_packet_xmit(struct sock *sk,
+ 	return airoha_soe_xfrm_packet_xmit(sk, skb, x);
+ }
+ 
++static struct airoha_eth *
++airoha_soe_xfrm_dev_eth(struct net_device *dev)
++{
++	const struct xfrmdev_ops *ops = READ_ONCE(dev->xfrmdev_ops);
++	struct airoha_gdm_dev *gdm_dev;
++	struct net_device *conduit;
++	struct airoha_eth *eth;
++
++	if (ops == &airoha_soe_xfrmdev_ops) {
++		gdm_dev = netdev_priv(dev);
++		return airoha_is_valid_gdm_dev(gdm_dev->eth, gdm_dev) ?
++		       gdm_dev->eth : NULL;
++	}
++	if (ops != &airoha_soe_dsa_xfrmdev_ops)
++		return NULL;
++
++	conduit = airoha_soe_dsa_conduit_get(NULL, dev);
++	if (!conduit)
++		return NULL;
++	gdm_dev = netdev_priv(conduit);
++	eth = gdm_dev->eth;
++	dev_put(conduit);
++
++	return eth;
++}
++
++static bool airoha_soe_xfrm_lag_compatible(struct net_device *dev,
++					   struct net_device *peer_dev)
++{
++	struct airoha_eth *eth = airoha_soe_xfrm_dev_eth(dev);
++
++	return eth && eth == airoha_soe_xfrm_dev_eth(peer_dev);
++}
++
+ static const struct xfrmdev_ops airoha_soe_xfrmdev_ops = {
+ 	.xdo_dev_state_add = airoha_soe_xfrm_state_add,
+ 	.xdo_dev_state_delete = airoha_soe_xfrm_state_delete,
+@@ -3560,6 +3597,9 @@ static const struct xfrmdev_ops airoha_soe_xfrmdev_ops = {
+ 	.xdo_dev_offload_ok = airoha_soe_xfrm_offload_ok,
+ 	.xdo_dev_policy_add = airoha_soe_xfrm_policy_add,
+ 	.xdo_dev_packet_xmit = airoha_soe_xfrm_packet_xmit,
++	.xdo_dev_state_lag_compatible = airoha_soe_xfrm_lag_compatible,
++	.flags = XFRMDEV_OPS_F_LOWER_HANDLE |
++		 XFRMDEV_OPS_F_LAG_SHARED_STATE,
+ };
+ 
+ static const struct xfrmdev_ops airoha_soe_dsa_xfrmdev_ops = {
+@@ -3569,6 +3609,9 @@ static const struct xfrmdev_ops airoha_soe_dsa_xfrmdev_ops = {
+ 	.xdo_dev_offload_ok = airoha_soe_dsa_xfrm_offload_ok,
+ 	.xdo_dev_policy_add = airoha_soe_dsa_xfrm_policy_add,
+ 	.xdo_dev_packet_xmit = airoha_soe_dsa_xfrm_packet_xmit,
++	.xdo_dev_state_lag_compatible = airoha_soe_xfrm_lag_compatible,
++	.flags = XFRMDEV_OPS_F_LOWER_HANDLE |
++		 XFRMDEV_OPS_F_LAG_SHARED_STATE,
+ };
+ 
+ static void airoha_soe_dsa_proxy_enable(struct airoha_soe *soe,
+@@ -3891,6 +3934,7 @@ int airoha_soe_init(struct airoha_eth *eth)
+ 	atomic_set(&soe->seq_pending, 0);
+ 	atomic_set(&soe->queued_ctx, 0);
+ 	atomic_set(&soe->active_ctx, 0);
++	atomic_set(&soe->xfrm_state_count, 0);
+ 	refcount_set(&soe->refcnt, 1);
+ 	init_completion(&soe->released);
+ 	INIT_WORK(&soe->fault_work, airoha_soe_fault_work);

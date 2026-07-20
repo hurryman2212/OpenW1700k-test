@@ -1,0 +1,27 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jihong Min <hurryman2212@gmail.com>
+Date: Tue, 4 Aug 2026 16:29:39 +0900
+Subject: [PATCH] xfrm: clear lower-device state during offload teardown
+
+Clear lower-device XFRM state before releasing the owning offload device.
+
+Assisted-by: Codex:gpt-5.6
+Signed-off-by: Jihong Min <hurryman2212@gmail.com>
+---
+ net/xfrm/xfrm_state.c | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/net/xfrm/xfrm_state.c b/net/xfrm/xfrm_state.c
+index d63d689..7687413 100644
+--- a/net/xfrm/xfrm_state.c
++++ b/net/xfrm/xfrm_state.c
+@@ -872,6 +872,9 @@ void xfrm_dev_state_free(struct xfrm_state *x)
+ 		hlist_del_init(&x->dev_gclist);
+ 	WRITE_ONCE(xso->dev, NULL);
+ 	WRITE_ONCE(xso->state_ops, NULL);
++	WRITE_ONCE(xso->real_dev, NULL);
++	WRITE_ONCE(xso->real_ops, NULL);
++	WRITE_ONCE(xso->offload_handle, 0);
+ 	xso->type = XFRM_DEV_OFFLOAD_UNSPECIFIED;
+ 	spin_unlock_bh(&xfrm_state_dev_gc_lock);
+ 	netdev_put(dev, &xso->dev_tracker);

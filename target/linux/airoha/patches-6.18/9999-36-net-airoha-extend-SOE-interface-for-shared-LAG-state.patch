@@ -1,0 +1,37 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jihong Min <hurryman2212@gmail.com>
+Date: Tue, 4 Aug 2026 16:29:39 +0900
+Subject: [PATCH] net: airoha: extend SOE interface for shared LAG state
+
+Expose the SOE operations needed to share XFRM state across LAG devices.
+
+Assisted-by: Codex:gpt-5.6
+Signed-off-by: Jihong Min <hurryman2212@gmail.com>
+---
+ drivers/net/ethernet/airoha/airoha_soe.h | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/net/ethernet/airoha/airoha_soe.h b/drivers/net/ethernet/airoha/airoha_soe.h
+index 56d6cc5..f77cbe5 100644
+--- a/drivers/net/ethernet/airoha/airoha_soe.h
++++ b/drivers/net/ethernet/airoha/airoha_soe.h
+@@ -93,7 +93,8 @@ bool airoha_soe_has_pending_ctx(struct airoha_soe *soe);
+ int airoha_soe_xmit(struct airoha_soe_sa *sa, struct airoha_gdm_dev *dev,
+ 		    struct sock *sk, struct sk_buff *skb, struct xfrm_state *x);
+ int airoha_soe_ppe_flow_add(struct airoha_soe *soe, struct xfrm_state *x,
+-			    u8 dir, struct airoha_soe_ppe_flow *flow,
++			    struct net_device *lower_dev, u8 dir,
++			    struct airoha_soe_ppe_flow *flow,
+ 			    struct airoha_soe_ppe_info *info);
+ void airoha_soe_ppe_flow_del(struct airoha_soe_ppe_flow *flow);
+ bool airoha_soe_ppe_flow_bind_start(struct airoha_soe_ppe_flow *flow,
+@@ -193,7 +194,8 @@ static inline int airoha_soe_xmit(struct airoha_soe_sa *sa,
+ }
+ 
+ static inline int
+-airoha_soe_ppe_flow_add(struct airoha_soe *soe, struct xfrm_state *x, u8 dir,
++airoha_soe_ppe_flow_add(struct airoha_soe *soe, struct xfrm_state *x,
++			struct net_device *lower_dev, u8 dir,
+ 			struct airoha_soe_ppe_flow *flow,
+ 			struct airoha_soe_ppe_info *info)
+ {

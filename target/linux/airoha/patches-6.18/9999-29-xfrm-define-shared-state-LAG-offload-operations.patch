@@ -1,0 +1,54 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jihong Min <hurryman2212@gmail.com>
+Date: Tue, 4 Aug 2026 16:29:39 +0900
+Subject: [PATCH] xfrm: define shared-state LAG offload operations
+
+Define network device operations for shared XFRM state across LAG lowers.
+
+Assisted-by: Codex:gpt-5.6
+Signed-off-by: Jihong Min <hurryman2212@gmail.com>
+---
+ include/linux/netdevice.h | 23 +++++++++++++++++++++++
+ 1 file changed, 23 insertions(+)
+
+diff --git a/include/linux/netdevice.h b/include/linux/netdevice.h
+index f08d3e5..f655edf 100644
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@ -1021,6 +1021,21 @@ struct netdev_bpf {
+ #define XDP_WAKEUP_TX (1 << 1)
+ 
+ #ifdef CONFIG_XFRM_OFFLOAD
++/*
++ * xfrmdev_ops.flags values.
++ *
++ * XFRMDEV_OPS_F_LOWER_HANDLE marks a lower driver whose datapath resolves
++ * device-private state with xfrm_dev_state_lower_handle(). This is required
++ * when an upper device owns the XFRM state.
++ *
++ * XFRMDEV_OPS_F_LAG_SHARED_STATE additionally certifies that one installed
++ * hardware state is valid on every lower device accepted by
++ * xdo_dev_state_lag_compatible(). The shared state must preserve one common
++ * sequence and replay context across those lower devices.
++ */
++#define XFRMDEV_OPS_F_LOWER_HANDLE	BIT(0)
++#define XFRMDEV_OPS_F_LAG_SHARED_STATE	BIT(1)
++
+ struct xfrmdev_ops {
+ 	int	(*xdo_dev_state_add)(struct net_device *dev,
+ 				     struct xfrm_state *x,
+@@ -1049,6 +1064,14 @@ struct xfrmdev_ops {
+ 	 */
+ 	int	(*xdo_dev_packet_xmit)(struct sock *sk, struct sk_buff *skb,
+ 				       struct xfrm_state *x);
++	/* Resolve an upper-owned state handle for a selected lower device. */
++	unsigned long (*xdo_dev_state_lower_handle)(struct net_device *dev,
++						    struct xfrm_state *x,
++						    struct net_device *lower_dev);
++	/* Check whether two lowers share one hardware XFRM state context. */
++	bool (*xdo_dev_state_lag_compatible)(struct net_device *dev,
++					     struct net_device *peer_dev);
++	u32	flags;
+ };
+ #endif
+ 
