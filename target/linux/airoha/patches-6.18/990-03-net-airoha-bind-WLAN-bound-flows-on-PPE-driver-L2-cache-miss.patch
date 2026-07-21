@@ -1,0 +1,270 @@
+From: Jihong Min <hurryman2212@gmail.com>
+Date: Mon, 25 May 2026 07:09:47 +0900
+Subject: [PATCH] net: airoha: bind WLAN-bound flows on PPE driver L2 cache miss
+
+The Linux bridge FDB can resolve a destination station to WDMA even when
+the Airoha PPE driver's L2 offload cache has no entry for that MAC pair.
+The normal bind path only checks the PPE driver's L2 offload cache, so an
+unbound PPE hit for WLAN egress can stay unbound even though the bridge
+already knows the right output path, unless a later offload event fills
+that PPE driver cache.
+
+This matters for bridge-visible WLAN egress, such as wired-to-WLAN
+forwarding or WLAN peer forwarding across another BSS, radio or MLO link.
+Same-link or same-radio intra-BSS forwarding can stay inside the WLAN
+datapath and is not covered.
+
+Before touching the PPE table, resolve the destination MAC through the
+bridge device above the ingress netdev. If the PPE driver's L2 offload
+cache lookup misses, bind the hardware flow to the resolved CDM4/WDMA
+path.
+
+Additionally fix the WDMA bind path: when a WDMA subflow is bound on L2
+cache miss, resolve the destination netdev through the bridge master
+rather than using the PPE entry's egress dev directly, which may point to
+a WLAN subordinate device that WDMA cannot DMA into. This centralizes the
+bridge-master resolution in the caller, removing the asymmetric
+RCU-protected dev_put pattern from the WDMA helper and avoiding a leaked
+reference on the non-WDMA error path.
+
+Also add the missing PPE_CPU_REASON_HIT_UNBIND (0x0e) enum value to
+airoha_offload.h, required for subflow PPE entry setup.
+
+Assisted-by: Codex:gpt-5.5
+Signed-off-by: Jihong Min <hurryman2212@gmail.com>
+---
+--- a/include/linux/soc/airoha/airoha_offload.h	2026-07-18 04:53:38.000000000 -1000
++++ b/include/linux/soc/airoha/airoha_offload.h	2026-07-26 13:47:26.303347890 -1000
+@@ -10,6 +10,7 @@
+ #include <linux/workqueue.h>
+ 
+ enum {
++	PPE_CPU_REASON_HIT_UNBIND = 0x0e,
+ 	PPE_CPU_REASON_HIT_UNBIND_RATE_REACHED = 0x0f,
+ };
+ 
+---
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c	2026-07-18 04:53:38.000000000 -1000
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c	2026-07-26 13:46:56.031194114 -1000
+@@ -763,65 +763,193 @@
+ }
+ 
+ static int
+-airoha_ppe_foe_commit_subflow_entry(struct airoha_ppe *ppe,
+-				    struct airoha_flow_table_entry *e,
+-				    u32 hash, bool rx_wlan)
++airoha_ppe_foe_commit_subflow(struct airoha_ppe *ppe,
++			      const struct airoha_foe_entry *bridge,
++			      u32 hash, bool rx_wlan)
+ {
+ 	u32 mask = AIROHA_FOE_IB1_BIND_PACKET_TYPE | AIROHA_FOE_IB1_BIND_UDP;
+ 	struct airoha_foe_entry *hwe_p, hwe;
+-	struct airoha_flow_table_entry *f;
+ 	int type;
+ 
+ 	hwe_p = airoha_ppe_foe_get_entry_locked(ppe, hash);
+ 	if (!hwe_p)
+ 		return -EINVAL;
+ 
+-	f = kzalloc(sizeof(*f), GFP_ATOMIC);
+-	if (!f)
+-		return -ENOMEM;
+-
+-	hlist_add_head(&f->l2_subflow_node, &e->l2_flows);
+-	f->type = FLOW_TYPE_L2_SUBFLOW;
+-	f->hash = hash;
+-
+ 	memcpy(&hwe, hwe_p, sizeof(*hwe_p));
+-	hwe.ib1 = (hwe.ib1 & mask) | (e->data.ib1 & ~mask);
++	/* When the HW slot is INVALID (all zeros), there is no
++	 * auto-learned packet type to preserve -- masking in that
++	 * case would zero out PACKET_TYPE, dropping it from
++	 * PPE_PKT_TYPE_BRIDGE (2) to PPE_PKT_TYPE_IPV4_HNAPT (0)
++	 * and breaking forwarding.  Use bridge->ib1 verbatim instead.
++	 *
++	 * The verbatim copy trusts the caller to have set
++	 * AIROHA_FOE_STATE_BIND (airoha_ppe_foe_entry_prepare() does).
++	 * Guard against any other future caller that has not prepared
++	 * the entry: writing it back unchanged would persist an
++	 * INVALID slot and silently drop the flow.
++	 */
++	if (FIELD_GET(AIROHA_FOE_IB1_BIND_STATE, hwe.ib1) ==
++	    AIROHA_FOE_STATE_INVALID) {
++		if (FIELD_GET(AIROHA_FOE_IB1_BIND_STATE, bridge->ib1) !=
++		    AIROHA_FOE_STATE_BIND) {
++			pr_debug_ratelimited("airoha_ppe: refusing INVALID slot bind with non-BIND bridge ib1=0x%08x\n",
++					      bridge->ib1);
++			return -EINVAL;
++		}
++		hwe.ib1 = bridge->ib1;
++	} else {
++		hwe.ib1 = (hwe.ib1 & mask) | (bridge->ib1 & ~mask);
++	}
+ 
+ 	type = FIELD_GET(AIROHA_FOE_IB1_BIND_PACKET_TYPE, hwe.ib1);
+ 	if (type >= PPE_PKT_TYPE_IPV6_ROUTE_3T) {
+-		memcpy(&hwe.ipv6.l2, &e->data.bridge.l2, sizeof(hwe.ipv6.l2));
+-		hwe.ipv6.ib2 = e->data.bridge.ib2;
++		memcpy(&hwe.ipv6.l2, &bridge->bridge.l2,
++		       sizeof(hwe.ipv6.l2));
++		hwe.ipv6.ib2 = bridge->bridge.ib2;
+ 		/* setting smac_id to 0xf instruct the hw to keep original
+ 		 * source mac address
+ 		 */
+ 		hwe.ipv6.l2.src_mac_hi = FIELD_PREP(AIROHA_FOE_MAC_SMAC_ID,
+ 						    0xf);
+ 	} else {
+-		memcpy(&hwe.bridge.l2, &e->data.bridge.l2,
++		memcpy(&hwe.bridge.l2, &bridge->bridge.l2,
+ 		       sizeof(hwe.bridge.l2));
+-		hwe.bridge.ib2 = e->data.bridge.ib2;
++		hwe.bridge.ib2 = bridge->bridge.ib2;
+ 		if (type == PPE_PKT_TYPE_IPV4_HNAPT)
+ 			memcpy(&hwe.ipv4.new_tuple, &hwe.ipv4.orig_tuple,
+ 			       sizeof(hwe.ipv4.new_tuple));
+ 	}
+ 
+-	hwe.bridge.data = e->data.bridge.data;
+-	airoha_ppe_foe_commit_entry(ppe, &hwe, hash, rx_wlan);
++	hwe.bridge.data = bridge->bridge.data;
++	return airoha_ppe_foe_commit_entry(ppe, &hwe, hash, rx_wlan);
++}
++
++static int
++airoha_ppe_foe_commit_subflow_entry(struct airoha_ppe *ppe,
++				    struct airoha_flow_table_entry *e,
++				    u32 hash, bool rx_wlan)
++{
++	struct airoha_flow_table_entry *f;
++	int err;
++
++	f = kzalloc(sizeof(*f), GFP_ATOMIC);
++	if (!f)
++		return -ENOMEM;
++
++	err = airoha_ppe_foe_commit_subflow(ppe, &e->data, hash, rx_wlan);
++	if (err) {
++		kfree(f);
++		return err;
++	}
++
++	hlist_add_head(&f->l2_subflow_node, &e->l2_flows);
++	f->type = FLOW_TYPE_L2_SUBFLOW;
++	f->hash = hash;
+ 
+ 	return 0;
+ }
+ 
++static bool
++airoha_ppe_foe_prepare_wdma_subflow(struct airoha_ppe *ppe,
++				    struct sk_buff *skb,
++				    struct airoha_foe_entry *hwe)
++{
++	struct ethhdr *eh = eth_hdr(skb);
++	struct airoha_flow_data data = {};
++	struct net_device *master = NULL;
++	bool ret = false;
++	u32 pse_port;
++	int err;
++
++	/* Source must be a real unicast address; destination can be
++	 * unicast or multicast/broadcast (e.g. mDNS/IPTV), so reject
++	 * only all-zero destinations.  Using is_valid_ether_addr() for
++	 * the destination was the original bug -- it silently rejected
++	 * multicast WLAN egress.
++	 */
++	if (!is_valid_ether_addr(eh->h_source) ||
++	    is_zero_ether_addr(eh->h_dest))
++		return false;
++
++	ether_addr_copy(data.eth.h_dest, eh->h_dest);
++	ether_addr_copy(data.eth.h_source, eh->h_source);
++
++	if (!skb->dev) {
++		pr_debug_ratelimited("airoha_ppe: skb without dev, skipping WDMA bind\n");
++		return false;
++	}
++
++	/* WLAN egress unbound hits can arrive before flowtable creates the
++	 * L2 master flow normally used for subflow binding.  Resolve only
++	 * through the bridge master so dev_fill_forward_path() must use the
++	 * bridge FDB for the destination MAC.  Calling the ingress AP netdev
++	 * directly can describe the source station's WDMA path and would
++	 * corrupt Wi-Fi-to-wired flows whose real egress is not WDMA.
++	 *
++	 * Hold one short RCU section for the bridge master lookup; the
++	 * subsequent airoha_ppe_foe_entry_prepare() takes its own RCU
++	 * section around dev_fill_forward_path() internally.  The
++	 * dev_hold() keeps the master alive across that call.  This
++	 * replaces the previous airoha_ppe_foe_get_bridge_master()
++	 * helper so the whole helper set has a single dev_put() exit.
++	 */
++	rcu_read_lock();
++	master = netdev_master_upper_dev_get_rcu(skb->dev);
++	if (master && netif_is_bridge_master(master))
++		dev_hold(master);
++	else
++		master = NULL;
++	rcu_read_unlock();
++
++	if (!master) {
++		pr_debug_ratelimited("airoha_ppe: no bridge master above %s, skipping WDMA bind\n",
++				     skb->dev->name);
++		return false;
++	}
++
++	err = airoha_ppe_foe_entry_prepare(ppe->eth, hwe, master,
++					   PPE_PKT_TYPE_BRIDGE, &data, 0, 0);
++	if (err) {
++		pr_debug_ratelimited("airoha_ppe: foe_entry_prepare failed on %s: %pe\n",
++				     master->name, ERR_PTR(err));
++		goto out;
++	}
++
++	pse_port = FIELD_GET(AIROHA_FOE_IB2_PSE_PORT, hwe->bridge.ib2);
++	if (pse_port != FE_PSE_PORT_CDM4) {
++		/* The bridge FDB resolved a wired egress, not WLAN.  Not
++		 * an error -- the L2 cache miss simply does not get a
++		 * WDMA bind.  Log once in a while so missed binds are
++		 * visible when debugging.
++		 */
++		pr_debug_ratelimited("airoha_ppe: dest %pM on %s not on WLAN (pse_port=%u), skipping WDMA bind\n",
++				     eh->h_dest, master->name, pse_port);
++		goto out;
++	}
++
++	ret = true;
++
++out:
++	dev_put(master);
++	return ret;
++}
++
+ static void airoha_ppe_foe_insert_entry(struct airoha_ppe *ppe,
+ 					struct sk_buff *skb,
+ 					u32 hash, bool rx_wlan)
+ {
++	struct airoha_foe_entry wdma_hwe = {};
+ 	struct airoha_flow_table_entry *e;
+ 	struct airoha_foe_bridge br = {};
+ 	struct airoha_foe_entry *hwe;
+ 	bool commit_done = false;
++	bool wdma_ready = false;
+ 	struct hlist_node *n;
+ 	u32 index, state;
+ 
++	wdma_ready = airoha_ppe_foe_prepare_wdma_subflow(ppe, skb,
++							 &wdma_hwe);
++
+ 	spin_lock_bh(&ppe_lock);
+ 
+ 	hwe = airoha_ppe_foe_get_entry_locked(ppe, hash);
+@@ -859,6 +987,8 @@
+ 				   airoha_l2_flow_table_params);
+ 	if (e)
+ 		airoha_ppe_foe_commit_subflow_entry(ppe, e, hash, rx_wlan);
++	else if (wdma_ready)
++		airoha_ppe_foe_commit_subflow(ppe, &wdma_hwe, hash, rx_wlan);
+ unlock:
+ 	spin_unlock_bh(&ppe_lock);
+ }
