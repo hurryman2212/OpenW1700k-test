@@ -1,0 +1,264 @@
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -1090,6 +1090,29 @@
+ 
+ 		airoha_ppe_foe_commit_entry(ppe, &e->data, hash, rx_wlan);
+ 		commit_done = true;
++#ifdef CONFIG_NET_SWITCHDEV
++		/* DIAG (999-90): aggregate per-second count of HW FOE commits
++		 * reaching this point.  Throttle to one log line per second
++		 * per PPE instance; each line reports how many commits
++		 * happened in the last 1 s window.  Per-commit logging is
++		 * pure spam during sustained throughput and adds no
++		 * diagnostic value beyond confirming traffic is flowing.
++		 */
++		if (rx_wlan) {
++			static unsigned long diag_commit_last[2];
++			static u32 diag_commit_count[2];
++			u32 inst = hash >= PPE_SRAM_NUM_ENTRIES ? 1 : 0;
++
++			diag_commit_count[inst]++;
++			if (time_after(jiffies,
++				       diag_commit_last[inst] + HZ)) {
++				pr_info("DIAG COMMIT PPE%u: %u commits/s\n",
++					inst + 1, diag_commit_count[inst]);
++				diag_commit_last[inst] = jiffies;
++				diag_commit_count[inst] = 0;
++			}
++		}
++#endif
+ 		e->hash = hash;
+ 	}
+ 
+@@ -1454,6 +1477,29 @@
+ 	return err;
+ }
+ 
++#ifdef CONFIG_NET_SWITCHDEV
++/* DIAG (999-90): counters used to assess whether the deferred
++ * airoha_ppe_fdb_work_handler / airoha_ppe_flush_*_flows_by_mac
++ * walks are pulling their weight vs the SW flow_offload teardown
++ * chain (FLOW_CLS_DESTROY -> airoha_ppe_flow_offload_destroy),
++ * which independently invalidates the same HW FOE entries by
++ * cookie-keyed lookup.  If across many real disconnect/reconnect
++ * cycles the worker's walks consistently find zero entries not
++ * already torn down via cookie, the walks are redundant and
++ * patches 930 / 0013 / 0014 / 990-04 / 990-05 can be dropped.
++ */
++static atomic_t diag_sw_destroy_count = ATOMIC_INIT(0);
++static atomic_t diag_l2_scan = ATOMIC_INIT(0);
++static atomic_t diag_l2_match = ATOMIC_INIT(0);
++static atomic_t diag_l2_gen_skip = ATOMIC_INIT(0);
++static atomic_t diag_l2_removed = ATOMIC_INIT(0);
++static atomic_t diag_l4_scan = ATOMIC_INIT(0);
++static atomic_t diag_l4_match = ATOMIC_INIT(0);
++static atomic_t diag_l4_gen_skip = ATOMIC_INIT(0);
++static atomic_t diag_l4_removed = ATOMIC_INIT(0);
++static atomic_t diag_worker_count = ATOMIC_INIT(0);
++#endif
++
+ static int airoha_ppe_flow_offload_destroy(struct airoha_eth *eth,
+ 					   struct flow_cls_offload *f)
+ {
+@@ -1468,6 +1514,16 @@
+ 	rhashtable_remove_fast(&eth->flow_table, &e->node,
+ 			       airoha_flow_table_params);
+ 	kfree(e);
++#ifdef CONFIG_NET_SWITCHDEV
++	/* DIAG (999-90): the SW flow_offload teardown chain
++	 * (FLOW_CLS_DESTROY -> airoha_ppe_flow_offload_destroy) just
++	 * independently invalidated an HW FOE entry.  Compare this
++	 * counter's per-worker-invocation delta against the L2/L4
++	 * walk's l*_removed counts to gauge whether the deferred
++	 * MAC-walk discovers entries the SW path missed.
++	 */
++	atomic_inc(&diag_sw_destroy_count);
++#endif
+ 
+ 	return 0;
+ }
+@@ -1531,17 +1587,25 @@
+ 	while ((e = rhashtable_walk_next(&iter)) != NULL) {
+ 		if (IS_ERR(e))
+ 			continue;
++#ifdef CONFIG_NET_SWITCHDEV
++		atomic_inc(&diag_l2_scan);
++#endif
+ 		if (!airoha_ppe_l2_flow_has_mac(e, addr))
+ 			continue;
+ #ifdef CONFIG_NET_SWITCHDEV
++		atomic_inc(&diag_l2_match);
++#endif
++#ifdef CONFIG_NET_SWITCHDEV
+ 		/* Skip L2 master flows created at or after this event's
+ 		 * captured generation -- they are NEW flows for the same
+ 		 * MAC established AFTER the disconnect that triggered
+ 		 * this flush, so removing them would re-introduce the
+ 		 * very stall we are trying to recover from.
+ 		 */
+-		if (gen && e->cleanup_gen >= gen)
++		if (gen && e->cleanup_gen >= gen) {
++			atomic_inc(&diag_l2_gen_skip);
+ 			continue;
++		}
+ #endif
+ 		hlist_add_head(&e->l2_subflow_node, &to_remove);
+ 	}
+@@ -1565,6 +1629,9 @@
+ 				       airoha_flow_table_params);
+ 		kfree(e);
+ 		removed = true;
++#ifdef CONFIG_NET_SWITCHDEV
++		atomic_inc(&diag_l2_removed);
++#endif
+ 	}
+ 	return removed;
+ }
+@@ -1587,15 +1654,23 @@
+ 		hlist_for_each_entry(e, &ppe->foe_flow[i], list) {
+ 			if (e->type != FLOW_TYPE_L4)
+ 				continue;
++#ifdef CONFIG_NET_SWITCHDEV
++			atomic_inc(&diag_l4_scan);
++#endif
+ 			if (!airoha_ppe_l4_flow_has_mac(e, addr))
+ 				continue;
+ #ifdef CONFIG_NET_SWITCHDEV
++			atomic_inc(&diag_l4_match);
++#endif
++#ifdef CONFIG_NET_SWITCHDEV
+ 			/* Skip L4 flows created at or after this event's
+ 			 * captured generation; see comment in
+ 			 * airoha_ppe_flush_l2_flows_by_mac().
+ 			 */
+-			if (gen && e->cleanup_gen >= gen)
++			if (gen && e->cleanup_gen >= gen) {
++				atomic_inc(&diag_l4_gen_skip);
+ 				continue;
++			}
+ #endif
+ 			hlist_add_head(&e->l2_subflow_node, &to_remove);
+ 		}
+@@ -1612,6 +1687,9 @@
+ 		rhashtable_remove_fast(&ppe->eth->flow_table, &e->node,
+ 				       airoha_flow_table_params);
+ 		kfree(e);
++#ifdef CONFIG_NET_SWITCHDEV
++		atomic_inc(&diag_l4_removed);
++#endif
+ 	}
+ 	spin_unlock_bh(&ppe_lock);
+ 
+@@ -1655,6 +1733,19 @@
+ 	 */
+ 	u32 gen = atomic_read(&flow_mac_cleanup_gen);
+ 	void (*teardown_by_eth_gen)(const u8 *addr, u32 gen);
++	/* DIAG (999-90): snapshot counters at entry, log the
++	 * per-event delta at exit.  The walks bump global atomics,
++	 * so a per-event delta is snapshot_before -> snapshot_after.
++	 */
++	u32 sw_before = atomic_read(&diag_sw_destroy_count);
++	u32 l2_scan_b = atomic_read(&diag_l2_scan);
++	u32 l2_match_b = atomic_read(&diag_l2_match);
++	u32 l2_gskip_b = atomic_read(&diag_l2_gen_skip);
++	u32 l2_rm_b = atomic_read(&diag_l2_removed);
++	u32 l4_scan_b = atomic_read(&diag_l4_scan);
++	u32 l4_match_b = atomic_read(&diag_l4_match);
++	u32 l4_gskip_b = atomic_read(&diag_l4_gen_skip);
++	u32 l4_rm_b = atomic_read(&diag_l4_removed);
+ #else
+ 	void (*teardown_by_eth)(const u8 *addr);
+ #endif
+@@ -1720,6 +1811,70 @@
+ 		mutex_unlock(&flow_offload_mutex);
+ 	}
+ 
++#ifdef CONFIG_NET_SWITCHDEV
++	/* DIAG (999-90): per-event summary.
++	 * l2_scan/l4_scan     : entries the walk iterated over
++	 * l2_match/l4_match   : entries whose MAC matched the target
++	 * l2_gen_skip/l4_gen_skip : match-entries skipped by the gen gate
++	 * l2_removed/l4_removed   : entries actually freed
++	 * sw_destroy_delta    : how many SW TC-destroy runs (cookie-keyed
++	 *   HW teardown) fired while this worker was running.  This is a
++	 *   crude proxy for "did the SW flow_offload path clobber the
++	 *   same entries either before the walks reached them or as a
++	 *   result of the teardown_by_eth_gen call inside this worker?"
++	 *
++	 * Interpretation:
++	 *   l*_removed == 0  + sw_destroy_delta > 0
++	 *     -> the worker found nothing stale; the SW path beat it.
++	 *        The MAC walk is redundant for this event.
++	 *   l*_removed > 0   + sw_destroy_delta == 0
++	 *     -> the worker found & freed entries the SW path had not
++	 *        touched.  Worker is pulling its weight this event.
++	 *   l*_removed > 0   + sw_destroy_delta > 0
++	 *     -> both paths acted; partial overlap, hard to attribute
++	 *        with this diag alone.  L2_subflow_node list state is
++	 *        drained by remove_l2_flow so a worker that fires
++	 *        after SW destroy typically finds nothing.
++	 */
++	{
++		u32 sw_after = atomic_read(&diag_sw_destroy_count);
++		u32 sw_delta = sw_after - sw_before;
++		u32 l2_scan_d = atomic_read(&diag_l2_scan) - l2_scan_b;
++		u32 l2_match_d = atomic_read(&diag_l2_match) - l2_match_b;
++		u32 l2_gskip_d = atomic_read(&diag_l2_gen_skip) - l2_gskip_b;
++		u32 l2_rm_d = atomic_read(&diag_l2_removed) - l2_rm_b;
++		u32 l4_scan_d = atomic_read(&diag_l4_scan) - l4_scan_b;
++		u32 l4_match_d = atomic_read(&diag_l4_match) - l4_match_b;
++		u32 l4_gskip_d = atomic_read(&diag_l4_gen_skip) - l4_gskip_b;
++		u32 l4_rm_d = atomic_read(&diag_l4_removed) - l4_rm_b;
++		u32 ev = atomic_inc_return(&diag_worker_count);
++
++		/* Suppress per-event log when nothing actually happened:
++		 * no MAC-matched entries found in either L2 or L4 walks,
++		 * no entries freed, no gen-gate skips, and no SW-side
++		 * flow_offload destroys raced in parallel.  Most deferred
++		 * worker invocations (background FDB churn) have all-zero
++		 * counters; logging every one was drowning out the events
++		 * that actually carry a signal.
++		 *
++		 * Preserve gskip logging as the race-fix liveness signal:
++		 * a gskip>0 means gen-gate caught a flow F' created after
++		 * the disconnect's bump and correctly left it alone.
++		 */
++		if (l2_match_d || l2_rm_d || l2_gskip_d ||
++		    l4_match_d || l4_rm_d || l4_gskip_d || sw_delta) {
++			pr_info("DIAG WORKER[%u] mac=%pM gen=%u "
++				"l2: scan=%u match=%u gskip=%u rm=%u | "
++				"l4: scan=%u match=%u gskip=%u rm=%u | "
++				"sw_destroy_delta=%u\n",
++				ev, w->addr, gen,
++				l2_scan_d, l2_match_d, l2_gskip_d, l2_rm_d,
++				l4_scan_d, l4_match_d, l4_gskip_d, l4_rm_d,
++				sw_delta);
++		}
++	}
++#endif
++
+ 	kfree(w);
+ }
+ 
+@@ -1999,6 +2154,21 @@
+ 	if (hash > ppe_hash_mask)
+ 		return;
+ 
++	if (rx_wlan) {
++		static unsigned long diag_last;
++		static u32 diag_tot, diag_p1, diag_p2, diag_miss;
++		diag_tot++;
++		if (hash == 0) diag_miss++;
++		else if (hash >= PPE_SRAM_NUM_ENTRIES) diag_p2++;
++		else diag_p1++;
++		if (time_after(jiffies, diag_last + HZ * 10)) {
++			pr_info("DIAG WiFi[%lu]: tot=%u ppe1=%u ppe2=%u miss=%u\n",
++				jiffies / HZ, diag_tot, diag_p1, diag_p2, diag_miss);
++			diag_last = jiffies;
++			diag_tot = diag_p1 = diag_p2 = diag_miss = 0;
++		}
++	}
++
+ 	now = (u16)jiffies;
+ 	diff = now - ppe->foe_check_time[hash];
+ 	if (diff < HZ / 10)
