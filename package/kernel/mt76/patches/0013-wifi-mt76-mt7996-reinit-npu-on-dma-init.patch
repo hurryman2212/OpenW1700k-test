@@ -1,0 +1,40 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OpenWrt <noreply@openwrt.org>
+Date: Sat, 25 Jul 2026 00:00:00 +0000
+Subject: [PATCH] wifi: mt76: mt7996: reinit NPU on DMA init
+
+After a WiFi radio cycle (interface down/up), the WiFi firmware resets
+the NPU packet processing state.  Only the DMA ring plumbing is
+restored by mt7996_npu_rx_queues_init(), but the offload configuration
+(ring PCIe addresses, token sizes, descriptor base addresses) is not
+re-sent to the NPU firmware.  This causes the NPU to stop writing
+FOE_ID/CRSN into RX DMA descriptors, breaking PPE flow commits for
+upload traffic.
+
+Reinitialize the NPU after DMA ring setup, following the same
+sequence used in L1 SER recovery: disable IRQs, stop the NPU
+firmware, then re-init under mutex.
+
+Skip on first boot when npu_txd_addr has not been allocated yet
+(mt7996_npu_hw_init runs after mt7996_dma_init in the probe path).
+
+Signed-off-by: OpenWrt <noreply@openwrt.org>
+---
+--- a/mt7996/dma.c
++++ b/mt7996/dma.c
+@@ -948,6 +948,15 @@
+ 	if (ret)
+ 		return ret;
+ 
++	if (dev->npu_txd_addr[0]) {
++		mt76_npu_disable_irqs(&dev->mt76);
++		mt7996_npu_hw_stop(dev);
++
++		mutex_lock(&dev->mt76.mutex);
++		__mt7996_npu_hw_init(dev);
++		mutex_unlock(&dev->mt76.mutex);
++	}
++
+ 	netif_napi_add_tx(dev->mt76.tx_napi_dev, &dev->mt76.tx_napi,
+ 			  mt7996_poll_tx);
+ 	napi_enable(&dev->mt76.tx_napi);
