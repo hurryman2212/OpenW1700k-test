@@ -30,15 +30,25 @@ incremented on each FDB DEL event; flows stamp their creation
 generation; the cleanup iterator skips flows whose cleanup_gen is at or
 after the generation that triggered the cleanup.
 
+The generation is bumped via atomic_inc_return() in the switchdev
+notifier and the resulting value is passed through to the cleanup work
+(rather than being re-read from the global counter inside
+nf_flow_table_cleanup_mac()).  This closes a race where a flow created
+between this event's bump and a subsequent event's bump would be wrongly
+torn down by the earlier event's cleanup work (the work's gen would
+have been re-read after the later bump, making it newer than the new
+flow's cleanup_gen).  If the GFP_ATOMIC allocation in
+nf_flow_table_cleanup_mac() fails, no cleanup runs for this event but
+the gen counter is still advanced; this is safe because future flows
+simply stamp a higher cleanup_gen, and any flow that should have been
+torn down by the missed event will be caught by the next cleanup for
+the same MAC or by the periodic GC.
+
 Reduce the default bridge FDB ageing time from 300s to 30s (matching
 802.1D-2004 clause 17.11.5).  This is the safety net for stale entries
 that the switchdev FDB DEL notifier misses: when a WiFi STA
 disconnects, its FDB entry now ages out in 30s instead of 5 minutes,
 preventing hardware-offloaded flows from forwarding into a dead path.
-
-Also add pr_warn diagnostics on rhashtable_insert_fast() failures in
-flow_offload_add() so insertion failures are observable instead of
-silent -ENOMEM/-EEXIST returns.
 
 Companion patches:
 - 990-02 (airoha_ppe): fixes flow teardown/re-insertion and the
@@ -51,8 +61,8 @@ Signed-off-by: Chad Monroe <chad@monroe.io>
 ---
  include/linux/if_bridge.h             |    2 +-
  include/net/netfilter/nf_flow_table.h |   11 ++
- net/netfilter/nf_flow_table_core.c    |  155 +++++++++++++++++++++++
- 3 files changed, 166 insertions(+), 1 deletion(-)
+ net/netfilter/nf_flow_table_core.c    |  165 +++++++++++++++++++++++
+ 3 files changed, 177 insertions(+), 1 deletion(-)
 
 diff --git a/include/linux/if_bridge.h b/include/linux/if_bridge.h
 index c5fe3b2..04c43c1 100644
@@ -141,25 +151,7 @@ diff --git a/net/netfilter/nf_flow_table_core.c b/net/netfilter/nf_flow_table_co
  static void
  flow_offload_fill_dir(struct flow_offload *flow,
  		      enum flow_offload_tuple_dir dir)
-@@ -324,13 +341,16 @@ int flow_offload_add(struct nf_flowtable *flow_table, struct flow_offload *flow)
- 	err = rhashtable_insert_fast(&flow_table->rhashtable,
- 				     &flow->tuplehash[0].node,
- 				     nf_flow_offload_rhash_params);
--	if (err < 0)
-+	if (err < 0) {
-+		pr_warn("FLOW_ADD: rhashtable insert[0] FAILED err=%d\n", err);
- 		return err;
-+	}
- 
- 	err = rhashtable_insert_fast(&flow_table->rhashtable,
- 				     &flow->tuplehash[1].node,
- 				     nf_flow_offload_rhash_params);
- 	if (err < 0) {
-+		pr_warn("FLOW_ADD: rhashtable insert[1] FAILED err=%d\n", err);
- 		rhashtable_remove_fast(&flow_table->rhashtable,
- 				       &flow->tuplehash[0].node,
- 				       nf_flow_offload_rhash_params);
-@@ -339,6 +359,13 @@ int flow_offload_add(struct nf_flowtable *flow_table, struct flow_offload *flow)
+@@ -340,6 +357,13 @@ int flow_offload_add(struct nf_flowtable *flow_table, struct flow_offload *flow)
  
  	nf_ct_refresh(flow->ct, NF_CT_DAY);
  
@@ -195,7 +187,7 @@ diff --git a/net/netfilter/nf_flow_table_core.c b/net/netfilter/nf_flow_table_co
  
  	err = rhashtable_init(&flowtable->rhashtable,
  			      &nf_flow_offload_rhash_params);
-@@ -748,6 +783,101 @@ void nf_flow_table_cleanup(struct net_device *dev)
+@@ -748,6 +783,116 @@ void nf_flow_table_cleanup(struct net_device *dev)
  }
  EXPORT_SYMBOL_GPL(nf_flow_table_cleanup);
  
@@ -248,7 +240,8 @@ diff --git a/net/netfilter/nf_flow_table_core.c b/net/netfilter/nf_flow_table_co
 +	kfree(cleanup);
 +}
 +
-+static void nf_flow_table_cleanup_mac(struct net *net, const unsigned char *mac)
++static void nf_flow_table_cleanup_mac(struct net *net, const unsigned char *mac,
++				      u32 gen)
 +{
 +	struct flow_mac_cleanup *cleanup;
 +
@@ -256,7 +249,7 @@ diff --git a/net/netfilter/nf_flow_table_core.c b/net/netfilter/nf_flow_table_co
 +	if (!cleanup)
 +		return;
 +
-+	cleanup->gen = atomic_read(&flow_mac_cleanup_gen);
++	cleanup->gen = gen;
 +	cleanup->net = get_net(net);
 +	memcpy(cleanup->mac, mac, ETH_ALEN);
 +	INIT_WORK(&cleanup->work, nf_flow_table_mac_cleanup_work);
@@ -267,6 +260,7 @@ diff --git a/net/netfilter/nf_flow_table_core.c b/net/netfilter/nf_flow_table_co
 +					 unsigned long event, void *ptr)
 +{
 +	struct switchdev_notifier_fdb_info *fdb_info = ptr;
++	u32 gen;
 +
 +	if (event != SWITCHDEV_FDB_DEL_TO_DEVICE)
 +		return NOTIFY_DONE;
@@ -283,9 +277,22 @@ diff --git a/net/netfilter/nf_flow_table_core.c b/net/netfilter/nf_flow_table_co
 +	if (!netif_oper_up(fdb_info->info.dev))
 +		return NOTIFY_DONE;
 +
-+	atomic_inc(&flow_mac_cleanup_gen);
++	/* Capture the bumped generation at the notifier so the cleanup work
++	 * uses the generation that corresponds to *this* FDB DEL event rather
++	 * than re-reading the global counter, which may have advanced further
++	 * by the time the work is scheduled.  This closes a race where a flow
++	 * created between this event's bump and a subsequent bump would be
++	 * wrongly torn down by the earlier event's cleanup work.
++	 * The bump is done via atomic_inc_return so it is atomic with the
++	 * value capture.  If the subsequent kmalloc in
++	 * nf_flow_table_cleanup_mac() fails, no cleanup runs for this event;
++	 * the gen counter is still moved forward, which is safe because it
++	 * only causes future flows to stamp a higher cleanup_gen (and thus
++	 * be skipped by any future cleanup that does run).
++	 */
++	gen = atomic_inc_return(&flow_mac_cleanup_gen);
 +
-+	nf_flow_table_cleanup_mac(dev_net(fdb_info->info.dev), fdb_info->addr);
++	nf_flow_table_cleanup_mac(dev_net(fdb_info->info.dev), fdb_info->addr, gen);
 +	return NOTIFY_DONE;
 +}
 +
