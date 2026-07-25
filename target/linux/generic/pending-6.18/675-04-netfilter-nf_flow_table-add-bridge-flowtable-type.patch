@@ -1,6 +1,6 @@
 From: Ryan Chen <rchen14b@gmail.com>
 Date: Sun, 16 Mar 2026 12:00:00 -0500
-Subject: [PATCH 4/6] netfilter: nf_flow_table: add bridge flowtable type
+Subject: [PATCH 4/5] netfilter: nf_flow_table: add bridge flowtable type
 
 Add a new nf_flowtable_type for NFPROTO_BRIDGE so that nftables
 flowtable declarations can be placed in bridge-family tables.

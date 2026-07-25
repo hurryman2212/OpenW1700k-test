@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Hauke Mehrtens <hauke@hauke-m.de>
 Date: Thu, 14 Nov 2024 00:18:04 +0100
-Subject: [PATCH 3/6] netfilter: nft_flow_offload: add L2 bridge offload
+Subject: [PATCH 3/5] netfilter: nft_flow_offload: add L2 bridge offload
  support
 
 Add L2 bridge offload support to the nftables flow offload infrastructure.
@@ -14,8 +14,18 @@ The nft_flow_route_bridging() function handles bridge path resolution by:
   - Determining the egress VLAN configuration
   - Populating the bridge path segment for the forward path
 
-nft_flow_offload_is_bridging() detects packets that should use bridge
-offload instead of routing offload by checking netif_is_bridge_port().
+nft_flow_offload_is_bridging() performs an RCU-protected FDB lookup to
+detect packets that should use bridge offload instead of routing
+offload.  It assumes the caller has already verified that skb->dev is a
+bridge port (the eval dispatcher hoists that check before calling) so
+the helper itself only guards for a present MAC header.
+
+The eval dispatcher short-circuits bridge-family tables via
+nft_pf(pkt) == NFPROTO_BRIDGE before any FDB lookup, and for non-bridge
+tables it gates on netif_is_bridge_port(pkt->skb->dev) so routed-family
+tables (NFPROTO_IPV4/6/INET) skip the RCU-protected
+br_fdb_has_forwarding_entry_rcu() call for packets that are not on a
+bridge port.
 
 nft_flow_route_routing() is the renamed nft_flow_route() with an added
 null-dst guard to prevent kernel panics when no L3 route exists for a
@@ -50,7 +60,7 @@ Signed-off-by: Hauke Mehrtens <hauke@hauke-m.de>
  
  struct nft_flow_offload {
  	struct nft_flowtable	*flowtable;
-@@ -46,7 +50,25 @@
+@@ -46,7 +50,23 @@
  	return true;
  }
  
@@ -59,8 +69,6 @@ Signed-off-by: Hauke Mehrtens <hauke@hauke-m.de>
 +{
 +	bool ret;
 +
-+	if (!netif_is_bridge_port(skb->dev))
-+		return false;
 +	if (!skb_mac_header_was_set(skb))
 +		return false;
 +
@@ -77,7 +85,7 @@ Signed-off-by: Hauke Mehrtens <hauke@hauke-m.de>
  				     const struct dst_entry *dst_cache,
  				     const struct nf_conn *ct,
  				     enum ip_conntrack_dir dir, u8 *ha,
-@@ -60,6 +82,12 @@
+@@ -60,6 +80,12 @@
  	if (!nft_is_valid_ether_device(dev))
  		goto out;
  
@@ -90,7 +98,7 @@ Signed-off-by: Hauke Mehrtens <hauke@hauke-m.de>
  	n = dst_neigh_lookup(dst_cache, daddr);
  	if (!n)
  		return -1;
-@@ -74,7 +102,7 @@
+@@ -74,7 +100,7 @@
  		return -1;
  
  out:
@@ -99,7 +107,7 @@ Signed-off-by: Hauke Mehrtens <hauke@hauke-m.de>
  }
  
  struct nft_forward_info {
-@@ -103,12 +131,12 @@
+@@ -103,12 +129,12 @@
  
  	for (i = 0; i < stack->num_paths; i++) {
  		path = &stack->path[i];
@@ -113,7 +121,7 @@ Signed-off-by: Hauke Mehrtens <hauke@hauke-m.de>
  			if (is_zero_ether_addr(info->h_source))
  				memcpy(info->h_source, path->dev->dev_addr, ETH_ALEN);
  
-@@ -149,21 +177,24 @@
+@@ -149,21 +175,24 @@
  				info->encap[info->num_encaps].proto = path->bridge.vlan_proto;
  				info->num_encaps++;
  				break;
@@ -149,7 +157,7 @@ Signed-off-by: Hauke Mehrtens <hauke@hauke-m.de>
  	}
  	if (!info->outdev)
  		info->outdev = info->indev;
-@@ -193,22 +223,77 @@
+@@ -193,22 +221,77 @@
  	return found;
  }
  
@@ -234,7 +242,7 @@ Signed-off-by: Hauke Mehrtens <hauke@hauke-m.de>
  
  	route->tuple[!dir].in.ifindex = info.indev->ifindex;
  	for (i = 0; i < info.num_encaps; i++) {
-@@ -225,18 +310,23 @@
+@@ -225,18 +308,23 @@
  		route->tuple[dir].out.hw_ifindex = info.hw_outdev->ifindex;
  		route->tuple[dir].xmit_type = info.xmit_type;
  	}
@@ -263,7 +271,7 @@ Signed-off-by: Hauke Mehrtens <hauke@hauke-m.de>
  	memset(&fl, 0, sizeof(fl));
  	switch (nft_pf(pkt)) {
  	case NFPROTO_IPV4:
-@@ -271,10 +355,81 @@
+@@ -271,10 +353,85 @@
  	nft_default_forward_path(route, this_dst, dir);
  	nft_default_forward_path(route, other_dst, !dir);
  
@@ -302,28 +310,32 @@ Signed-off-by: Hauke Mehrtens <hauke@hauke-m.de>
 +
 +	/* Use the conntrack tuple L3 protocol instead of nft_pf()
 +	 * so this works in both inet and bridge family tables.
++	 *
++	 * Both directions anchor to the same br_dev with identical parameters,
++	 * so allocate one dst and bump its refcount via dst_hold() to share it
++	 * between the two directions.
 +	 */
 +	switch (ct->tuplehash[dir].tuple.src.l3num) {
 +	case NFPROTO_IPV4: {
 +		struct rtable *rt;
 +
 +		rt = rt_dst_alloc(br_dev, 0, RTN_UNICAST, true);
-+		if (rt)
++		if (rt) {
 +			dsts[dir] = &rt->dst;
-+		rt = rt_dst_alloc(br_dev, 0, RTN_UNICAST, true);
-+		if (rt)
++			dst_hold(&rt->dst);
 +			dsts[!dir] = &rt->dst;
++		}
 +		break;
 +	}
 +	case NFPROTO_IPV6: {
 +		struct rt6_info *rt;
 +
 +		rt = ip6_dst_alloc(nft_net(pkt), br_dev, 0);
-+		if (rt)
++		if (rt) {
 +			dsts[dir] = &rt->dst;
-+		rt = ip6_dst_alloc(nft_net(pkt), br_dev, 0);
-+		if (rt)
++			dst_hold(&rt->dst);
 +			dsts[!dir] = &rt->dst;
++		}
 +		break;
 +	}
 +	}
@@ -348,13 +360,15 @@ Signed-off-by: Hauke Mehrtens <hauke@hauke-m.de>
  	}
  
  	return 0;
-@@ -365,8 +526,13 @@
+@@ -365,8 +524,15 @@
  		goto out;
  
  	dir = CTINFO2DIR(ctinfo);
 -	if (nft_flow_route(pkt, ct, &route, dir, priv->flowtable) < 0)
 -		goto err_flow_route;
-+	if (nft_pf(pkt) == NFPROTO_BRIDGE || nft_flow_offload_is_bridging(pkt->skb)) {
++	if (nft_pf(pkt) == NFPROTO_BRIDGE ||
++	    (netif_is_bridge_port(pkt->skb->dev) &&
++	     nft_flow_offload_is_bridging(pkt->skb))) {
 +		if (nft_flow_route_bridging(pkt, ct, &route, dir, priv->flowtable) < 0)
 +			goto err_flow_route;
 +	} else {
