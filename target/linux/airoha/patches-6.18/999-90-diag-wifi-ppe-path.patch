@@ -1,0 +1,38 @@
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -959,6 +959,11 @@
+ 
+ 		airoha_ppe_foe_commit_entry(ppe, &e->data, hash, rx_wlan);
+ 		commit_done = true;
++		if (rx_wlan) {
++			u32 inst = hash >= PPE_SRAM_NUM_ENTRIES ? 2 : 1;
++			pr_info("DIAG COMMIT h=0x%04x PPE%u ib1=0x%08x\n",
++				hash, inst, e->data.ib1);
++		}
+ 		e->hash = hash;
+ 	}
+ 
+@@ -1539,8 +1544,23 @@ void airoha_ppe_check_skb(struct airoha_ppe_dev *dev, struct sk_buff *skb,
+ 	if (hash > ppe_hash_mask)
+ 		return;
+ 
++	if (rx_wlan) {
++		static unsigned long diag_last;
++		static u32 diag_tot, diag_p1, diag_p2, diag_miss;
++		diag_tot++;
++		if (hash == 0) diag_miss++;
++		else if (hash >= PPE_SRAM_NUM_ENTRIES) diag_p2++;
++		else diag_p1++;
++		if (time_after(jiffies, diag_last + HZ * 5)) {
++			pr_info("DIAG WiFi[%lu]: tot=%u ppe1=%u ppe2=%u miss=%u\n",
++				jiffies / HZ, diag_tot, diag_p1, diag_p2, diag_miss);
++			diag_last = jiffies;
++			diag_tot = diag_p1 = diag_p2 = diag_miss = 0;
++		}
++	}
++
+ 	now = (u16)jiffies;
+ 	diff = now - ppe->foe_check_time[hash];
+ 	if (diff < HZ / 10)
+ 		return;
+ 
