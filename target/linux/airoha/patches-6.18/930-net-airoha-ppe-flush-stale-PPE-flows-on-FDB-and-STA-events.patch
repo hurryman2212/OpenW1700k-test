@@ -1,0 +1,319 @@
+From: OpenWrt <noreply@openwrt.org>
+Date: Mon, 30 Jun 2026 12:00:00 +0000
+Subject: [PATCH] net: airoha: ppe: flush stale PPE flows on FDB and WiFi STA events
+
+Same-BSS disconnect/reconnect often does NOT move the bridge FDB
+port, so SWITCHDEV_FDB_* never fires and a FDB-only flush misses the
+bug.  Expose flush_flows_by_mac() on airoha_ppe_dev for mt76 STA
+remove to invoke the same teardown partway.
+
+Bridge-family FOEs are PPE_PKT_TYPE_BRIDGE and cannot be
+flow_offload_teardown_by_tuple(); call flow_offload_teardown_by_eth()
+so IPS_OFFLOAD_BIT is cleared for Direct xmit flows matching the
+STA MAC.
+
+Register an switchdev notifier on SWITCHDEV_FDB_ADD_TO_DEVICE /
+SWITCHDEV_FDB_DEL_TO_DEVICE for bridge ports that removes matching
+L2 entries from l2_flows/flow_table and -- critically -- also walks
+ppe->foe_flow[] (the L4 flow hash chains) to invalidate and remove
+L4 HNAPT/5T entries whose L2 rewrite MACs match the STA.  Without
+this L4 sweep a stale L4 entry left in ppe->foe_flow[hash] is picked
+up by airoha_ppe_foe_insert_entry(), which re-commits it with the
+old MAC/port/WCID data, permanently blocking upload re-offload after
+relocation (download survives because its PSE port /  MAC rewrite
+directoin does not depend on the WiFi transmit WPID/port).
+
+Work is deferred to an ordered workqueue.  The l2_subflow_node is
+borrowed as a scratch link while iterating, then removed after
+the walk.
+
+Signed-off-by: OpenWrt <noreply@openwrt.org>
+---
+
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -592,6 +592,8 @@
+ 	struct airoha_npu __rcu *npu;
+ 
+ 	struct airoha_ppe *ppe;
++	struct notifier_block switchdev_nb;
++	struct workqueue_struct *fdb_wq;
+ 	struct rhashtable flow_table;
+ 
+ 	struct reset_control_bulk_data rsts[AIROHA_MAX_NUM_RSTS];
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -15,6 +15,9 @@
+ 
+ #include "airoha_regs.h"
+ #include "airoha_eth.h"
++#include <linux/module.h>
++#include <net/switchdev.h>
++#include <net/netfilter/nf_flow_table.h>
+ 
+ /* Serialize airoha_gdm_dev flags, QDMA pointer and PPE CPU port
+  * configuration.
+@@ -1226,6 +1230,196 @@
+ 	return 0;
+ }
+ 
++/* ---- flush stale PPE flows on bridge FDB / WiFi STA MAC events -------- */
++
++struct airoha_ppe_fdb_work {
++	struct work_struct work;
++	struct airoha_eth *eth;
++	u8 addr[ETH_ALEN];
++};
++
++static bool airoha_ppe_l2_flow_has_mac(const struct airoha_flow_table_entry *e,
++				       const u8 *addr)
++{
++	const struct airoha_foe_bridge *br = &e->data.bridge;
++
++	if (get_unaligned_be32(addr) == br->dest_mac_hi &&
++	    get_unaligned_be16(addr + 4) == br->dest_mac_lo)
++		return true;
++	if (get_unaligned_be16(addr) == br->src_mac_hi &&
++	    get_unaligned_be32(addr + 2) == br->src_mac_lo)
++		return true;
++	return false;
++}
++
++static bool airoha_ppe_l4_flow_has_mac(const struct airoha_flow_table_entry *e,
++				       const u8 *addr)
++{
++	const struct airoha_foe_mac_info_common *l2 = &e->data.ipv4.l2.common;
++	u32 mac_hi = get_unaligned_be32(addr);
++	u16 mac_lo = get_unaligned_be16(addr + 4);
++	u16 src_lo;
++
++	if (mac_hi == l2->dest_mac_hi && mac_lo == l2->dest_mac_lo)
++		return true;
++
++	src_lo = get_unaligned_be16(addr + 4);
++	if (mac_hi == l2->src_mac_hi && src_lo == e->data.ipv4.l2.src_mac_lo)
++		return true;
++
++	return false;
++}
++
++static bool airoha_ppe_flush_l2_flows_by_mac(struct airoha_eth *eth,
++					     const u8 *addr)
++{
++	struct airoha_ppe *ppe = eth->ppe;
++	struct airoha_flow_table_entry *e;
++	struct hlist_node *tmp;
++	HLIST_HEAD(to_remove);
++	struct rhashtable_iter iter;
++	bool removed = false;
++
++	rhashtable_walk_enter(&ppe->l2_flows, &iter);
++	rhashtable_walk_start(&iter);
++	while ((e = rhashtable_walk_next(&iter)) != NULL) {
++		if (!IS_ERR(e) && airoha_ppe_l2_flow_has_mac(e, addr))
++			hlist_add_head(&e->l2_subflow_node, &to_remove);
++	}
++	rhashtable_walk_stop(&iter);
++	rhashtable_walk_exit(&iter);
++
++	hlist_for_each_entry_safe(e, tmp, &to_remove, l2_subflow_node) {
++		struct airoha_flow_table_entry *sf;
++		struct hlist_node *stmp;
++		hlist_del_init(&e->l2_subflow_node);
++		spin_lock_bh(&ppe_lock);
++		hlist_for_each_entry_safe(sf, stmp, &e->l2_flows, l2_subflow_node) {
++			airoha_ppe_foe_remove_flow(ppe, sf);
++			hlist_del_init(&sf->l2_subflow_node);
++			kfree(sf);
++		}
++		spin_unlock_bh(&ppe_lock);
++		rhashtable_remove_fast(&ppe->l2_flows, &e->node,
++				       airoha_l2_flow_table_params);
++		rhashtable_remove_fast(&eth->flow_table, &e->node,
++				       airoha_flow_table_params);
++		kfree(e);
++		removed = true;
++	}
++	return removed;
++}
++
++static bool airoha_ppe_flush_l4_flows_by_mac(struct airoha_ppe *ppe,
++					     const u8 *addr)
++{
++	u32 sram_num_entries = airoha_ppe_get_total_sram_num_entries(ppe);
++	struct airoha_flow_table_entry *e;
++	struct hlist_node *tmp;
++	HLIST_HEAD(to_remove);
++	unsigned int i;
++
++	spin_lock_bh(&ppe_lock);
++	for (i = 0; i < sram_num_entries; i++) {
++		hlist_for_each_entry(e, &ppe->foe_flow[i], list) {
++			if (e->type == FLOW_TYPE_L4 &&
++			    airoha_ppe_l4_flow_has_mac(e, addr))
++				hlist_add_head(&e->l2_subflow_node, &to_remove);
++		}
++	}
++	spin_unlock_bh(&ppe_lock);
++
++	if (hlist_empty(&to_remove))
++		return false;
++
++	spin_lock_bh(&ppe_lock);
++	hlist_for_each_entry_safe(e, tmp, &to_remove, l2_subflow_node) {
++		hlist_del_init(&e->l2_subflow_node);
++		airoha_ppe_foe_remove_flow(ppe, e);
++		rhashtable_remove_fast(&ppe->eth->flow_table, &e->node,
++				       airoha_flow_table_params);
++		kfree(e);
++	}
++	spin_unlock_bh(&ppe_lock);
++
++	return true;
++}
++
++static void airoha_ppe_fdb_work_handler(struct work_struct *work)
++{
++	struct airoha_ppe_fdb_work *w = container_of(work, struct airoha_ppe_fdb_work,
++						     work);
++	void (*teardown_by_eth)(const u8 *addr);
++	bool l4_removed;
++	bool l2_removed;
++
++	mutex_lock(&flow_offload_mutex);
++	if (rcu_access_pointer(w->eth->npu)) {
++		l2_removed = airoha_ppe_flush_l2_flows_by_mac(w->eth, w->addr);
++		l4_removed = airoha_ppe_flush_l4_flows_by_mac(w->eth->ppe,
++							      w->addr);
++		mutex_unlock(&flow_offload_mutex);
++
++		if (l2_removed || l4_removed) {
++			teardown_by_eth = symbol_get(flow_offload_teardown_by_eth);
++			if (teardown_by_eth) {
++				teardown_by_eth(w->addr);
++				symbol_put(flow_offload_teardown_by_eth);
++			}
++		}
++	} else {
++		mutex_unlock(&flow_offload_mutex);
++	}
++
++	kfree(w);
++}
++
++static void airoha_ppe_schedule_flush_by_mac(struct airoha_eth *eth,
++					     const u8 *addr)
++{
++	struct airoha_ppe_fdb_work *w;
++
++	if (!eth->fdb_wq || !addr || is_zero_ether_addr(addr) ||
++	    is_multicast_ether_addr(addr))
++		return;
++
++	w = kmalloc(sizeof(*w), GFP_ATOMIC);
++	if (!w)
++		return;
++
++	INIT_WORK(&w->work, airoha_ppe_fdb_work_handler);
++	w->eth = eth;
++	ether_addr_copy(w->addr, addr);
++	queue_work(eth->fdb_wq, &w->work);
++}
++
++static void airoha_ppe_dev_flush_flows_by_mac_op(struct airoha_ppe_dev *dev,
++						 const u8 *addr)
++{
++	struct airoha_ppe *ppe = dev->priv;
++
++	airoha_ppe_schedule_flush_by_mac(ppe->eth, addr);
++}
++
++static int airoha_ppe_switchdev_event(struct notifier_block *nb,
++				      unsigned long event, void *ptr)
++{
++	struct airoha_eth *eth = container_of(nb, struct airoha_eth, switchdev_nb);
++	const struct switchdev_notifier_fdb_info *fdb_info = ptr;
++
++	if (event != SWITCHDEV_FDB_ADD_TO_DEVICE &&
++	    event != SWITCHDEV_FDB_DEL_TO_DEVICE)
++		return NOTIFY_DONE;
++	if (fdb_info->is_local || is_multicast_ether_addr(fdb_info->addr))
++		return NOTIFY_DONE;
++	if (!fdb_info->info.dev || !netif_is_bridge_port(fdb_info->info.dev))
++		return NOTIFY_DONE;
++
++	airoha_ppe_schedule_flush_by_mac(eth, fdb_info->addr);
++	return NOTIFY_DONE;
++}
++
++
+ void airoha_ppe_foe_entry_get_stats(struct airoha_ppe *ppe, u32 hash,
+ 				    struct airoha_foe_stats64 *stats)
+ {
+@@ -1522,6 +1716,7 @@
+ 
+ 	ppe->dev.ops.setup_tc_block_cb = airoha_ppe_setup_tc_block_cb;
+ 	ppe->dev.ops.check_skb = airoha_ppe_check_skb;
++	ppe->dev.ops.flush_flows_by_mac = airoha_ppe_dev_flush_flows_by_mac_op;
+ 	ppe->dev.priv = ppe;
+ 	ppe->eth = eth;
+ 	eth->ppe = ppe;
+@@ -1566,8 +1761,22 @@
+ 	if (err)
+ 		goto error_l2_flow_table_destroy;
+ 
++	eth->fdb_wq = alloc_ordered_workqueue("airoha_ppe_fdb", 0);
++	if (!eth->fdb_wq) {
++		err = -ENOMEM;
++		goto error_debugfs_destroy;
++	}
++	eth->switchdev_nb.notifier_call = airoha_ppe_switchdev_event;
++	err = register_switchdev_notifier(&eth->switchdev_nb);
++	if (err)
++		goto error_wq_destroy;
++
+ 	return 0;
+ 
++error_wq_destroy:
++	destroy_workqueue(eth->fdb_wq);
++error_debugfs_destroy:
++	debugfs_remove(ppe->debugfs_dir);
+ error_l2_flow_table_destroy:
+ 	rhashtable_destroy(&ppe->l2_flows);
+ error_flow_table_destroy:
+@@ -1580,6 +1775,9 @@
+ {
+ 	struct airoha_npu *npu;
+ 
++	unregister_switchdev_notifier(&eth->switchdev_nb);
++	destroy_workqueue(eth->fdb_wq);
++
+ 	mutex_lock(&flow_offload_mutex);
+ 
+ 	npu = rcu_replace_pointer(eth->npu, NULL,
+--- a/include/linux/soc/airoha/airoha_offload.h
++++ b/include/linux/soc/airoha/airoha_offload.h
+@@ -20,6 +20,8 @@
+ 		void (*check_skb)(struct airoha_ppe_dev *dev,
+ 				  struct sk_buff *skb, u16 hash,
+ 				  bool rx_wlan);
++		void (*flush_flows_by_mac)(struct airoha_ppe_dev *dev,
++					 const u8 *addr);
+ 	} ops;
+ 
+ 	void *priv;
+@@ -41,6 +43,13 @@
+ {
+ 	dev->ops.check_skb(dev, skb, hash, rx_wlan);
+ }
++
++static inline void airoha_ppe_dev_flush_flows_by_mac(struct airoha_ppe_dev *dev,
++						     const u8 *addr)
++{
++	if (dev->ops.flush_flows_by_mac)
++		dev->ops.flush_flows_by_mac(dev, addr);
++}
+ #else
+ static inline struct airoha_ppe_dev *airoha_ppe_get_dev(struct device *dev)
+ {
+
