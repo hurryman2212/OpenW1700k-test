@@ -1,0 +1,301 @@
+From f54609013874a375334b93f0f901ded3d09c408d Mon Sep 17 00:00:00 2001
+Message-ID: <f54609013874a375334b93f0f901ded3d09c408d.1785226804.git.hurryman2212@gmail.com>
+In-Reply-To: <cover.1785226804.git.hurryman2212@gmail.com>
+References: <cover.1785226804.git.hurryman2212@gmail.com>
+From: Jihong Min <hurryman2212@gmail.com>
+Date: Tue, 28 Jul 2026 15:28:11 +0900
+Subject: [PATCH 3/4] crypto: eip93 - add dynamic software fallback support
+To: Herbert Xu <herbert@gondor.apana.org.au>,
+ Christian Marangi <ansuelsmth@gmail.com>,
+ linux-crypto@vger.kernel.org
+Cc: "David S. Miller" <davem@davemloft.net>,
+ Antoine Tenart <atenart@kernel.org>,
+ linux-kernel@vger.kernel.org
+
+Group EIP93 skcipher, ahash, and authenc implementations by their
+request-size performance trends. Register generic fallback proxies that
+use one representative benchmark per group and dispatch each request to
+EIP93 or software according to the per-device threshold.
+
+Expose the fallback controls through the EIP93 device sysfs hierarchy
+and add the software algorithm dependencies required for benchmarking.
+
+Unregister the fallback proxies before removing the hardware providers.
+
+Signed-off-by: Jihong Min <hurryman2212@gmail.com>
+---
+ drivers/crypto/inside-secure/eip93/Kconfig    |   7 +
+ drivers/crypto/inside-secure/eip93/Makefile   |   1 +
+ .../inside-secure/eip93/eip93-fallback.c      | 164 ++++++++++++++++++
+ .../inside-secure/eip93/eip93-fallback.h      |  10 ++
+ .../crypto/inside-secure/eip93/eip93-main.c   |  19 +-
+ 5 files changed, 197 insertions(+), 4 deletions(-)
+ create mode 100644 drivers/crypto/inside-secure/eip93/eip93-fallback.c
+ create mode 100644 drivers/crypto/inside-secure/eip93/eip93-fallback.h
+
+diff --git a/drivers/crypto/inside-secure/eip93/Kconfig b/drivers/crypto/inside-secure/eip93/Kconfig
+index 29523f6927dd..ea8c417653d4 100644
+--- a/drivers/crypto/inside-secure/eip93/Kconfig
++++ b/drivers/crypto/inside-secure/eip93/Kconfig
+@@ -10,6 +10,13 @@ config CRYPTO_DEV_EIP93
+ 	select CRYPTO_MD5
+ 	select CRYPTO_SHA1
+ 	select CRYPTO_SHA256
++	select CRYPTO_DYNAMIC_FALLBACK
++	select CRYPTO_AES
++	select CRYPTO_CBC
++	select CRYPTO_CTR
++	select CRYPTO_DES
++	select CRYPTO_ECB
++	select CRYPTO_HMAC
+ 	help
+ 	  EIP93 have various crypto HW accelerators. Select this if
+ 	  you want to use the EIP93 modules for any of the crypto algorithms.
+diff --git a/drivers/crypto/inside-secure/eip93/Makefile b/drivers/crypto/inside-secure/eip93/Makefile
+index a3d3d3677cdc..b408d509bdd7 100644
+--- a/drivers/crypto/inside-secure/eip93/Makefile
++++ b/drivers/crypto/inside-secure/eip93/Makefile
+@@ -3,3 +3,4 @@ obj-$(CONFIG_CRYPTO_DEV_EIP93) += crypto-hw-eip93.o
+ crypto-hw-eip93-y += eip93-main.o eip93-common.o
+ crypto-hw-eip93-y += eip93-cipher.o eip93-aead.o
+ crypto-hw-eip93-y += eip93-hash.o
++crypto-hw-eip93-y += eip93-fallback.o
+diff --git a/drivers/crypto/inside-secure/eip93/eip93-fallback.c b/drivers/crypto/inside-secure/eip93/eip93-fallback.c
+new file mode 100644
+index 000000000000..78e4394b7e9e
+--- /dev/null
++++ b/drivers/crypto/inside-secure/eip93/eip93-fallback.c
+@@ -0,0 +1,164 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Copyright (C) 2026 Jihong Min <hurryman2212@gmail.com>
++ */
++
++#include <crypto/fallback.h>
++#include <crypto/md5.h>
++#include <linux/err.h>
++#include <linux/module.h>
++
++#include "eip93-fallback.h"
++#include "eip93-main.h"
++
++/*
++ * Fixed, non-secret keys used only for benchmark setup. The RFC 3686 key
++ * contains a 16-byte AES-128 key followed by its required 4-byte nonce.
++ */
++
++static const u8 eip93_fallback_aes_key[] = {
++	0x2b, 0x7e, 0x15, 0x16, 0x28, 0xae, 0xd2, 0xa6, 0xab, 0xf7,
++	0x15, 0x88, 0x09, 0xcf, 0x4f, 0x3c, 0x00, 0x00, 0x00, 0x01,
++};
++
++static const u8 eip93_fallback_des_key[] = {
++	0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef,
++};
++
++static const u8 eip93_fallback_3des_key[] = {
++	0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x23, 0x45, 0x67, 0x89,
++	0xab, 0xcd, 0xef, 0x01, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23,
++};
++
++static const u8 eip93_fallback_auth_key[] = {
++	0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b,
++	0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b,
++};
++
++/* Group EIP93 algorithms by their observed request-size performance trends. */
++
++static const char *const eip93_fallback_raw_aes[] = {
++	"ecb(aes-eip93)",
++	"cbc(aes-eip93)",
++	"ctr(aes-eip93)",
++	"rfc3686(ctr(aes-eip93))",
++};
++
++static const char *const eip93_fallback_raw_des[] = {
++	"ecb(des-eip93)",
++	"cbc(des-eip93)",
++};
++
++static const char *const eip93_fallback_raw_3des[] = {
++	"ecb(des3_ede-eip93)",
++	"cbc(des3_ede-eip93)",
++};
++
++static const char *const eip93_fallback_hash_md5[] = {
++	"md5-eip93",
++	"hmac(md5-eip93)",
++};
++
++static const char *const eip93_fallback_hash_sha1[] = {
++	"sha1-eip93",
++	"hmac(sha1-eip93)",
++};
++
++static const char *const eip93_fallback_hash_sha2[] = {
++	"sha224-eip93",
++	"sha256-eip93",
++	"hmac(sha224-eip93)",
++	"hmac(sha256-eip93)",
++};
++
++static const char *const eip93_fallback_authenc_aes[] = {
++	"authenc(hmac(md5-eip93), cbc(aes-eip93))",
++	"authenc(hmac(sha1-eip93),cbc(aes-eip93))",
++	"authenc(hmac(sha224-eip93),cbc(aes-eip93))",
++	"authenc(hmac(sha256-eip93),cbc(aes-eip93))",
++	"authenc(hmac(md5-eip93),rfc3686(ctr(aes-eip93)))",
++	"authenc(hmac(sha1-eip93),rfc3686(ctr(aes-eip93)))",
++	"authenc(hmac(sha224-eip93),rfc3686(ctr(aes-eip93)))",
++	"authenc(hmac(sha256-eip93),rfc3686(ctr(aes-eip93)))",
++};
++
++static const char *const eip93_fallback_authenc_des[] = {
++	"authenc(hmac(md5-eip93),cbc(des-eip93))",
++	"authenc(hmac(sha1-eip93),cbc(des-eip93))",
++	"authenc(hmac(sha224-eip93),cbc(des-eip93))",
++	"authenc(hmac(sha256-eip93),cbc(des-eip93))",
++};
++
++static const char *const eip93_fallback_authenc_3des[] = {
++	"authenc(hmac(md5-eip93),cbc(des3_ede-eip93))",
++	"authenc(hmac(sha1-eip93),cbc(des3_ede-eip93))",
++	"authenc(hmac(sha224-eip93),cbc(des3_ede-eip93))",
++	"authenc(hmac(sha256-eip93),cbc(des3_ede-eip93))",
++};
++
++static const struct crypto_fallback_group eip93_fallback_groups[] = {
++	CRYPTO_FALLBACK_GROUP("raw_aes", CRYPTO_FALLBACK_SKCIPHER,
++			      "rfc3686(ctr(aes))", "rfc3686(ctr(aes-eip93))",
++			      eip93_fallback_aes_key, eip93_fallback_raw_aes,
++			      ARRAY_SIZE(eip93_fallback_raw_aes)),
++	CRYPTO_FALLBACK_GROUP("raw_des", CRYPTO_FALLBACK_SKCIPHER, "ecb(des)",
++			      "ecb(des-eip93)", eip93_fallback_des_key,
++			      eip93_fallback_raw_des,
++			      ARRAY_SIZE(eip93_fallback_raw_des)),
++	CRYPTO_FALLBACK_GROUP("raw_3des", CRYPTO_FALLBACK_SKCIPHER,
++			      "cbc(des3_ede)", "cbc(des3_ede-eip93)",
++			      eip93_fallback_3des_key, eip93_fallback_raw_3des,
++			      ARRAY_SIZE(eip93_fallback_raw_3des)),
++	CRYPTO_FALLBACK_GROUP("hash_md5", CRYPTO_FALLBACK_AHASH, "hmac(md5)",
++			      "hmac(md5-eip93)", eip93_fallback_auth_key,
++			      eip93_fallback_hash_md5,
++			      ARRAY_SIZE(eip93_fallback_hash_md5)),
++	CRYPTO_FALLBACK_GROUP("hash_sha1", CRYPTO_FALLBACK_AHASH, "hmac(sha1)",
++			      "hmac(sha1-eip93)", eip93_fallback_auth_key,
++			      eip93_fallback_hash_sha1,
++			      ARRAY_SIZE(eip93_fallback_hash_sha1)),
++	CRYPTO_FALLBACK_GROUP("hash_sha2", CRYPTO_FALLBACK_AHASH,
++			      "hmac(sha256)", "hmac(sha256-eip93)",
++			      eip93_fallback_auth_key, eip93_fallback_hash_sha2,
++			      ARRAY_SIZE(eip93_fallback_hash_sha2)),
++	CRYPTO_FALLBACK_GROUP_AUTHENC("authenc_aes",
++				      "authenc(hmac(md5),rfc3686(ctr(aes)))",
++				      "authenc(hmac(md5-eip93),rfc3686(ctr(aes-eip93)))",
++				      eip93_fallback_aes_key,
++				      eip93_fallback_auth_key, MD5_DIGEST_SIZE,
++				      eip93_fallback_authenc_aes,
++				      ARRAY_SIZE(eip93_fallback_authenc_aes)),
++	CRYPTO_FALLBACK_GROUP_AUTHENC("authenc_des",
++				      "authenc(hmac(md5),cbc(des))",
++				      "authenc(hmac(md5-eip93),cbc(des-eip93))",
++				      eip93_fallback_des_key,
++				      eip93_fallback_auth_key, MD5_DIGEST_SIZE,
++				      eip93_fallback_authenc_des,
++				      ARRAY_SIZE(eip93_fallback_authenc_des)),
++	CRYPTO_FALLBACK_GROUP_AUTHENC("authenc_3des",
++				      "authenc(hmac(md5),cbc(des3_ede))",
++				      "authenc(hmac(md5-eip93),cbc(des3_ede-eip93))",
++				      eip93_fallback_3des_key,
++				      eip93_fallback_auth_key, MD5_DIGEST_SIZE,
++				      eip93_fallback_authenc_3des,
++				      ARRAY_SIZE(eip93_fallback_authenc_3des)),
++};
++
++static struct crypto_fallback *eip93_fallback;
++
++int eip93_fallback_register(struct eip93_device *eip93)
++{
++	eip93_fallback =
++		crypto_fallback_register(THIS_MODULE, eip93->dev,
++					 eip93_fallback_groups,
++					 ARRAY_SIZE(eip93_fallback_groups));
++
++	return PTR_ERR_OR_ZERO(eip93_fallback);
++}
++
++void eip93_fallback_unregister(void)
++{
++	crypto_fallback_unregister(eip93_fallback);
++
++	eip93_fallback = NULL;
++}
+diff --git a/drivers/crypto/inside-secure/eip93/eip93-fallback.h b/drivers/crypto/inside-secure/eip93/eip93-fallback.h
+new file mode 100644
+index 000000000000..e3ba9a66abc7
+--- /dev/null
++++ b/drivers/crypto/inside-secure/eip93/eip93-fallback.h
+@@ -0,0 +1,10 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef _EIP93_FALLBACK_H_
++#define _EIP93_FALLBACK_H_
++
++struct eip93_device;
++
++int eip93_fallback_register(struct eip93_device *eip93);
++void eip93_fallback_unregister(void);
++
++#endif /* _EIP93_FALLBACK_H_ */
+diff --git a/drivers/crypto/inside-secure/eip93/eip93-main.c b/drivers/crypto/inside-secure/eip93/eip93-main.c
+index 1a8dabc4ada4..96ecffeb75df 100644
+--- a/drivers/crypto/inside-secure/eip93/eip93-main.c
++++ b/drivers/crypto/inside-secure/eip93/eip93-main.c
+@@ -25,6 +25,7 @@
+ #include "eip93-aes.h"
+ #include "eip93-des.h"
+ #include "eip93-aead.h"
++#include "eip93-fallback.h"
+ #include "eip93-hash.h"
+ 
+ static struct eip93_alg_template *eip93_algs[] = {
+@@ -460,10 +461,12 @@ static int eip93_crypto_probe(struct platform_device *pdev)
+ 	eip93_irq_enable(eip93, EIP93_INT_RDR_THRESH);
+ 
+ 	ret = eip93_register_algs(eip93, algo_flags);
+-	if (ret) {
+-		eip93_cleanup(eip93);
+-		return ret;
+-	}
++	if (ret)
++		goto err_cleanup;
++
++	ret = eip93_fallback_register(eip93);
++	if (ret)
++		goto err_unregister_algs;
+ 
+ 	ver = readl(eip93->base + EIP93_REG_PE_REVISION);
+ 	/* EIP_EIP_NO:MAJOR_HW_REV:MINOR_HW_REV:HW_PATCH,PE(ALGO_FLAGS) */
+@@ -476,6 +479,13 @@ static int eip93_crypto_probe(struct platform_device *pdev)
+ 		 readl(eip93->base + EIP93_REG_PE_OPTION_0));
+ 
+ 	return 0;
++
++err_unregister_algs:
++	eip93_unregister_algs(algo_flags, ARRAY_SIZE(eip93_algs));
++err_cleanup:
++	eip93_cleanup(eip93);
++
++	return ret;
+ }
+ 
+ static void eip93_crypto_remove(struct platform_device *pdev)
+@@ -485,6 +495,7 @@ static void eip93_crypto_remove(struct platform_device *pdev)
+ 
+ 	algo_flags = readl(eip93->base + EIP93_REG_PE_OPTION_1);
+ 
++	eip93_fallback_unregister();
+ 	eip93_unregister_algs(algo_flags, ARRAY_SIZE(eip93_algs));
+ 	eip93_cleanup(eip93);
+ }
+-- 
+2.53.0

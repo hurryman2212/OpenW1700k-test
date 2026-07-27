@@ -1,0 +1,558 @@
+From e0ce93088c1d9772e928fcbd113a446b7fb7442f Mon Sep 17 00:00:00 2001
+Message-ID: <e0ce93088c1d9772e928fcbd113a446b7fb7442f.1785226804.git.hurryman2212@gmail.com>
+In-Reply-To: <cover.1785226804.git.hurryman2212@gmail.com>
+References: <cover.1785226804.git.hurryman2212@gmail.com>
+From: Jihong Min <hurryman2212@gmail.com>
+Date: Tue, 28 Jul 2026 11:51:55 +0900
+Subject: [PATCH 1/4] crypto: move cycle benchmark helpers out of tcrypt
+To: Herbert Xu <herbert@gondor.apana.org.au>,
+ Christian Marangi <ansuelsmth@gmail.com>,
+ linux-crypto@vger.kernel.org
+Cc: "David S. Miller" <davem@davemloft.net>,
+ Antoine Tenart <atenart@kernel.org>,
+ linux-kernel@vger.kernel.org
+
+Move the reusable AEAD, ahash, and skcipher cycle measurement loops
+into a dedicated benchmark module. Preserve tcrypt's existing output
+and benchmark behavior while allowing crypto drivers to use the same
+helpers for runtime comparisons.
+
+Signed-off-by: Jihong Min <hurryman2212@gmail.com>
+---
+ crypto/Kconfig             |  15 ++-
+ crypto/Makefile            |   2 +
+ crypto/benchmark.c         | 180 +++++++++++++++++++++++++++++++
+ crypto/tcrypt.c            | 213 +++++--------------------------------
+ include/crypto/benchmark.h |  24 +++++
+ 5 files changed, 242 insertions(+), 192 deletions(-)
+ create mode 100644 crypto/benchmark.c
+ create mode 100644 include/crypto/benchmark.h
+
+diff --git a/crypto/Kconfig b/crypto/Kconfig
+index f1e372195273..0cba261e3b88 100644
+--- a/crypto/Kconfig
++++ b/crypto/Kconfig
+@@ -257,9 +257,22 @@ config CRYPTO_KRB5ENC
+ 	  profile.  This is required for Kerberos 5-style encryption, used by
+ 	  sunrpc/NFS and rxrpc/AFS.
+ 
+-config CRYPTO_BENCHMARK
+-	tristate "Crypto benchmarking module"
+-	depends on m || EXPERT
++config CRYPTO_BENCHMARK_LIB
++	tristate
++	select CRYPTO_AEAD
++	select CRYPTO_HASH
++	select CRYPTO_MANAGER
++	select CRYPTO_SKCIPHER
++	help
++	  Build reusable benchmark helpers for Crypto API algorithms.  This
++	  internal library is shared by tcrypt and drivers that select
++	  implementations from measurements made while their devices are
++	  initialized.
++
++config CRYPTO_BENCHMARK
++	tristate "Crypto benchmarking module"
++	depends on m || EXPERT
++	select CRYPTO_BENCHMARK_LIB
+ 	select CRYPTO_MANAGER
+ 	help
+ 	  Quick & dirty crypto benchmarking module.
+ 
+diff --git a/crypto/Makefile b/crypto/Makefile
+index 8386d55a9755..77720b746503 100644
+--- a/crypto/Makefile
++++ b/crypto/Makefile
+@@ -172,6 +172,8 @@ UBSAN_SANITIZE_jitterentropy.o = n
+ jitterentropy_rng-y := jitterentropy.o jitterentropy-kcapi.o
+ obj-$(CONFIG_CRYPTO_JITTERENTROPY_TESTINTERFACE) += jitterentropy-testing.o
+ obj-$(CONFIG_CRYPTO_BENCHMARK) += tcrypt.o
++obj-$(CONFIG_CRYPTO_BENCHMARK_LIB) += crypt-benchmark.o
++crypt-benchmark-y := benchmark.o
+ obj-$(CONFIG_CRYPTO_GHASH) += ghash-generic.o
+ obj-$(CONFIG_CRYPTO_POLYVAL) += polyval-generic.o
+ obj-$(CONFIG_CRYPTO_USER_API) += af_alg.o
+diff --git a/crypto/benchmark.c b/crypto/benchmark.c
+new file mode 100644
+index 000000000000..ad27cdaa7491
+--- /dev/null
++++ b/crypto/benchmark.c
+@@ -0,0 +1,180 @@
++// SPDX-License-Identifier: GPL-2.0
++
++#include <crypto/aead.h>
++#include <crypto/benchmark.h>
++#include <crypto/hash.h>
++#include <crypto/skcipher.h>
++#include <linux/module.h>
++#include <linux/timex.h>
++
++int crypto_benchmark_aead_cycles(struct aead_request *req, bool encrypt,
++				 unsigned int warmup_runs, unsigned int runs,
++				 u64 *total_cycles)
++{
++	struct crypto_wait *wait;
++	unsigned int i;
++	u64 cycles = 0;
++	int ret;
++
++	if (!req || !req->base.data || !runs || !total_cycles)
++		return -EINVAL;
++
++	wait = req->base.data;
++	*total_cycles = 0;
++
++	for (i = 0; i < warmup_runs; i++) {
++		if (encrypt)
++			ret = crypto_wait_req(crypto_aead_encrypt(req), wait);
++		else
++			ret = crypto_wait_req(crypto_aead_decrypt(req), wait);
++		if (ret)
++			return ret;
++	}
++
++	for (i = 0; i < runs; i++) {
++		cycles_t start, end;
++
++		start = get_cycles();
++		if (encrypt)
++			ret = crypto_wait_req(crypto_aead_encrypt(req), wait);
++		else
++			ret = crypto_wait_req(crypto_aead_decrypt(req), wait);
++		end = get_cycles();
++		if (ret)
++			return ret;
++
++		cycles += end - start;
++	}
++
++	*total_cycles = cycles;
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(crypto_benchmark_aead_cycles);
++
++int crypto_benchmark_ahash_cycles(struct ahash_request *req,
++				  unsigned int block_size,
++				  unsigned int update_size,
++				  unsigned int warmup_runs, unsigned int runs,
++				  u64 *total_cycles)
++{
++	struct crypto_wait *wait;
++	unsigned int processed;
++	unsigned int i;
++	u64 cycles = 0;
++	int ret;
++
++	if (!req || !req->base.data || !block_size || !update_size ||
++	    block_size % update_size || !runs || !total_cycles)
++		return -EINVAL;
++
++	wait = req->base.data;
++	*total_cycles = 0;
++
++	for (i = 0; i < warmup_runs; i++) {
++		if (update_size == block_size) {
++			ret = crypto_wait_req(crypto_ahash_digest(req), wait);
++			if (ret)
++				return ret;
++			continue;
++		}
++
++		ret = crypto_wait_req(crypto_ahash_init(req), wait);
++		if (ret)
++			return ret;
++		for (processed = 0; processed < block_size;
++		     processed += update_size) {
++			ret = crypto_wait_req(crypto_ahash_update(req), wait);
++			if (ret)
++				return ret;
++		}
++		ret = crypto_wait_req(crypto_ahash_final(req), wait);
++		if (ret)
++			return ret;
++	}
++
++	for (i = 0; i < runs; i++) {
++		cycles_t start, end;
++
++		start = get_cycles();
++		if (update_size == block_size) {
++			ret = crypto_wait_req(crypto_ahash_digest(req), wait);
++		} else {
++			ret = crypto_wait_req(crypto_ahash_init(req), wait);
++			if (ret)
++				goto measure_end;
++			for (processed = 0; processed < block_size;
++			     processed += update_size) {
++				ret = crypto_wait_req(crypto_ahash_update(req),
++						      wait);
++				if (ret)
++					goto measure_end;
++			}
++			ret = crypto_wait_req(crypto_ahash_final(req), wait);
++		}
++measure_end:
++		end = get_cycles();
++		if (ret)
++			return ret;
++
++		cycles += end - start;
++	}
++
++	*total_cycles = cycles;
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(crypto_benchmark_ahash_cycles);
++
++int crypto_benchmark_skcipher_cycles(struct skcipher_request *req, bool encrypt,
++				     unsigned int warmup_runs,
++				     unsigned int runs, u64 *total_cycles)
++{
++	struct crypto_wait *wait;
++	unsigned int i;
++	u64 cycles = 0;
++	int ret;
++
++	if (!req || !req->base.data || !runs || !total_cycles)
++		return -EINVAL;
++
++	wait = req->base.data;
++	*total_cycles = 0;
++
++	for (i = 0; i < warmup_runs; i++) {
++		if (encrypt)
++			ret = crypto_wait_req(crypto_skcipher_encrypt(req),
++					      wait);
++		else
++			ret = crypto_wait_req(crypto_skcipher_decrypt(req),
++					      wait);
++		if (ret)
++			return ret;
++	}
++
++	for (i = 0; i < runs; i++) {
++		cycles_t start, end;
++
++		start = get_cycles();
++		if (encrypt)
++			ret = crypto_wait_req(crypto_skcipher_encrypt(req),
++					      wait);
++		else
++			ret = crypto_wait_req(crypto_skcipher_decrypt(req),
++					      wait);
++		end = get_cycles();
++		if (ret)
++			return ret;
++
++		cycles += end - start;
++	}
++
++	*total_cycles = cycles;
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(crypto_benchmark_skcipher_cycles);
++
++MODULE_AUTHOR("Jihong Min <hurryman2212@gmail.com>");
++MODULE_DESCRIPTION("Crypto API benchmark helpers");
++MODULE_LICENSE("GPL");
+diff --git a/crypto/tcrypt.c b/crypto/tcrypt.c
+index 61a2501bfe9b..81c77f3d7a17 100644
+--- a/crypto/tcrypt.c
++++ b/crypto/tcrypt.c
+@@ -20,6 +20,7 @@
+ #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+ 
+ #include <crypto/aead.h>
++#include <crypto/benchmark.h>
+ #include <crypto/hash.h>
+ #include <crypto/skcipher.h>
+ #include <linux/err.h>
+@@ -473,48 +474,6 @@ static int test_aead_jiffies(struct aead_request *req, int enc,
+ 	return 0;
+ }
+ 
+-static int test_aead_cycles(struct aead_request *req, int enc, int blen)
+-{
+-	unsigned long cycles = 0;
+-	int ret = 0;
+-	int i;
+-
+-	/* Warm-up run. */
+-	for (i = 0; i < 4; i++) {
+-		if (enc)
+-			ret = do_one_aead_op(req, crypto_aead_encrypt(req));
+-		else
+-			ret = do_one_aead_op(req, crypto_aead_decrypt(req));
+-
+-		if (ret)
+-			goto out;
+-	}
+-
+-	/* The real thing. */
+-	for (i = 0; i < 8; i++) {
+-		cycles_t start, end;
+-
+-		start = get_cycles();
+-		if (enc)
+-			ret = do_one_aead_op(req, crypto_aead_encrypt(req));
+-		else
+-			ret = do_one_aead_op(req, crypto_aead_decrypt(req));
+-		end = get_cycles();
+-
+-		if (ret)
+-			goto out;
+-
+-		cycles += end - start;
+-	}
+-
+-out:
+-	if (ret == 0)
+-		pr_cont("1 operation in %lu cycles (%d bytes)\n",
+-			(cycles + 4) / 8, blen);
+-
+-	return ret;
+-}
+-
+ static void test_aead_speed(const char *algo, int enc, unsigned int secs,
+ 			    struct aead_speed_template *template,
+ 			    unsigned int tcount, u8 authsize,
+@@ -669,7 +628,13 @@ static void test_aead_speed(const char *algo, int enc, unsigned int secs,
+ 							secs);
+ 				cond_resched();
+ 			} else {
+-				ret = test_aead_cycles(req, enc, bs);
++				u64 cycles;
++
++				ret = crypto_benchmark_aead_cycles(req, enc, 4,
++								   8, &cycles);
++				if (!ret)
++					pr_cont("1 operation in %llu cycles (%d bytes)\n",
++						(cycles + 4) / 8, bs);
+ 			}
+ 
+ 			if (ret) {
+@@ -768,101 +733,6 @@ static int test_ahash_jiffies(struct ahash_request *req, int blen,
+ 	return 0;
+ }
+ 
+-static int test_ahash_cycles_digest(struct ahash_request *req, int blen,
+-				    char *out)
+-{
+-	unsigned long cycles = 0;
+-	int ret, i;
+-
+-	/* Warm-up run. */
+-	for (i = 0; i < 4; i++) {
+-		ret = do_one_ahash_op(req, crypto_ahash_digest(req));
+-		if (ret)
+-			goto out;
+-	}
+-
+-	/* The real thing. */
+-	for (i = 0; i < 8; i++) {
+-		cycles_t start, end;
+-
+-		start = get_cycles();
+-
+-		ret = do_one_ahash_op(req, crypto_ahash_digest(req));
+-		if (ret)
+-			goto out;
+-
+-		end = get_cycles();
+-
+-		cycles += end - start;
+-	}
+-
+-out:
+-	if (ret)
+-		return ret;
+-
+-	pr_cont("%6lu cycles/operation, %4lu cycles/byte\n",
+-		cycles / 8, cycles / (8 * blen));
+-
+-	return 0;
+-}
+-
+-static int test_ahash_cycles(struct ahash_request *req, int blen,
+-			     int plen, char *out)
+-{
+-	unsigned long cycles = 0;
+-	int i, pcount, ret;
+-
+-	if (plen == blen)
+-		return test_ahash_cycles_digest(req, blen, out);
+-
+-	/* Warm-up run. */
+-	for (i = 0; i < 4; i++) {
+-		ret = do_one_ahash_op(req, crypto_ahash_init(req));
+-		if (ret)
+-			goto out;
+-		for (pcount = 0; pcount < blen; pcount += plen) {
+-			ret = do_one_ahash_op(req, crypto_ahash_update(req));
+-			if (ret)
+-				goto out;
+-		}
+-		ret = do_one_ahash_op(req, crypto_ahash_final(req));
+-		if (ret)
+-			goto out;
+-	}
+-
+-	/* The real thing. */
+-	for (i = 0; i < 8; i++) {
+-		cycles_t start, end;
+-
+-		start = get_cycles();
+-
+-		ret = do_one_ahash_op(req, crypto_ahash_init(req));
+-		if (ret)
+-			goto out;
+-		for (pcount = 0; pcount < blen; pcount += plen) {
+-			ret = do_one_ahash_op(req, crypto_ahash_update(req));
+-			if (ret)
+-				goto out;
+-		}
+-		ret = do_one_ahash_op(req, crypto_ahash_final(req));
+-		if (ret)
+-			goto out;
+-
+-		end = get_cycles();
+-
+-		cycles += end - start;
+-	}
+-
+-out:
+-	if (ret)
+-		return ret;
+-
+-	pr_cont("%6lu cycles/operation, %4lu cycles/byte\n",
+-		cycles / 8, cycles / (8 * blen));
+-
+-	return 0;
+-}
+-
+ static void test_ahash_speed_common(const char *algo, unsigned int secs,
+ 				    struct hash_speed *speed, unsigned mask)
+ {
+@@ -931,8 +801,15 @@ static void test_ahash_speed_common(const char *algo, unsigned int secs,
+ 						 speed[i].plen, output, secs);
+ 			cond_resched();
+ 		} else {
+-			ret = test_ahash_cycles(req, speed[i].blen,
+-						speed[i].plen, output);
++			u64 cycles;
++
++			ret = crypto_benchmark_ahash_cycles(req, speed[i].blen,
++							    speed[i].plen, 4, 8,
++							    &cycles);
++			if (!ret)
++				pr_cont("%6llu cycles/operation, %4llu cycles/byte\n",
++					cycles / 8,
++					cycles / (8 * speed[i].blen));
+ 		}
+ 
+ 		if (ret) {
+@@ -1249,53 +1126,6 @@ static int test_acipher_jiffies(struct skcipher_request *req, int enc,
+ 	return 0;
+ }
+ 
+-static int test_acipher_cycles(struct skcipher_request *req, int enc,
+-			       int blen)
+-{
+-	unsigned long cycles = 0;
+-	int ret = 0;
+-	int i;
+-
+-	/* Warm-up run. */
+-	for (i = 0; i < 4; i++) {
+-		if (enc)
+-			ret = do_one_acipher_op(req,
+-						crypto_skcipher_encrypt(req));
+-		else
+-			ret = do_one_acipher_op(req,
+-						crypto_skcipher_decrypt(req));
+-
+-		if (ret)
+-			goto out;
+-	}
+-
+-	/* The real thing. */
+-	for (i = 0; i < 8; i++) {
+-		cycles_t start, end;
+-
+-		start = get_cycles();
+-		if (enc)
+-			ret = do_one_acipher_op(req,
+-						crypto_skcipher_encrypt(req));
+-		else
+-			ret = do_one_acipher_op(req,
+-						crypto_skcipher_decrypt(req));
+-		end = get_cycles();
+-
+-		if (ret)
+-			goto out;
+-
+-		cycles += end - start;
+-	}
+-
+-out:
+-	if (ret == 0)
+-		pr_cont("1 operation in %lu cycles (%d bytes)\n",
+-			(cycles + 4) / 8, blen);
+-
+-	return ret;
+-}
+-
+ static void test_skcipher_speed(const char *algo, int enc, unsigned int secs,
+ 				struct cipher_speed_template *template,
+ 				unsigned int tcount, u8 *keysize, bool async)
+@@ -1405,8 +1235,13 @@ static void test_skcipher_speed(const char *algo, int enc, unsigned int secs,
+ 							   bs, secs);
+ 				cond_resched();
+ 			} else {
+-				ret = test_acipher_cycles(req, enc,
+-							  bs);
++				u64 cycles;
++
++				ret = crypto_benchmark_skcipher_cycles(req, enc, 4,
++								       8, &cycles);
++				if (!ret)
++					pr_cont("1 operation in %llu cycles (%d bytes)\n",
++						(cycles + 4) / 8, bs);
+ 			}
+ 
+ 			if (ret) {
+diff --git a/include/crypto/benchmark.h b/include/crypto/benchmark.h
+new file mode 100644
+index 000000000000..09dc0fb38483
+--- /dev/null
++++ b/include/crypto/benchmark.h
+@@ -0,0 +1,24 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef _CRYPTO_BENCHMARK_H
++#define _CRYPTO_BENCHMARK_H
++
++#include <linux/types.h>
++
++struct aead_request;
++struct ahash_request;
++struct skcipher_request;
++
++/* Requests must use crypto_req_done() with struct crypto_wait callback data. */
++int crypto_benchmark_aead_cycles(struct aead_request *req, bool encrypt,
++				 unsigned int warmup_runs, unsigned int runs,
++				 u64 *total_cycles);
++int crypto_benchmark_ahash_cycles(struct ahash_request *req,
++				  unsigned int block_size,
++				  unsigned int update_size,
++				  unsigned int warmup_runs, unsigned int runs,
++				  u64 *total_cycles);
++int crypto_benchmark_skcipher_cycles(struct skcipher_request *req, bool encrypt,
++				     unsigned int warmup_runs,
++				     unsigned int runs, u64 *total_cycles);
++
++#endif /* _CRYPTO_BENCHMARK_H */
+-- 
+2.53.0

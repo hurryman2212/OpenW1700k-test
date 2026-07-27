@@ -78,6 +78,16 @@ endef
 $(eval $(call KernelPackage,crypto-authenc))
 
 
+define KernelPackage/crypto-benchmark
+  TITLE:=CryptoAPI benchmark helper library
+  KCONFIG:=CONFIG_CRYPTO_BENCHMARK_LIB
+  FILES:=$(LINUX_DIR)/crypto/crypt-benchmark.ko
+  $(call AddDepends/crypto)
+endef
+
+$(eval $(call KernelPackage,crypto-benchmark))
+
+
 define KernelPackage/crypto-blake2b
   TITLE:=Support for BLAKE2b cryptographic hash function (RFC 7693)
   DEPENDS:=+kmod-crypto-hash
@@ -212,6 +222,17 @@ define KernelPackage/crypto-des
 endef
 
 $(eval $(call KernelPackage,crypto-des))
+
+
+define KernelPackage/crypto-dynamic-fallback
+  TITLE:=Dynamic CryptoAPI software fallback
+  DEPENDS:=+kmod-crypto-benchmark
+  KCONFIG:=CONFIG_CRYPTO_DYNAMIC_FALLBACK
+  FILES:=$(LINUX_DIR)/crypto/fallback.ko
+  $(call AddDepends/crypto)
+endef
+
+$(eval $(call KernelPackage,crypto-dynamic-fallback))
 
 
 define KernelPackage/crypto-ecb
@@ -525,15 +546,14 @@ define KernelPackage/crypto-hw-eip93
   TITLE:=MTK EIP93 crypto module
   DEPENDS:=@(TARGET_ramips_mt7621||TARGET_airoha) \
 	+kmod-crypto-authenc \
+	+kmod-crypto-dynamic-fallback \
 	+kmod-crypto-des \
 	+kmod-crypto-md5 \
 	+kmod-crypto-sha1 \
 	+kmod-crypto-sha256
   KCONFIG:= \
 	CONFIG_CRYPTO_HW=y \
-	CONFIG_CRYPTO_DEV_EIP93 \
-	CONFIG_CRYPTO_DEV_EIP93_GENERIC_SW_MAX_LEN=256 \
-	CONFIG_CRYPTO_DEV_EIP93_AES_128_SW_MAX_LEN=512
+	CONFIG_CRYPTO_DEV_EIP93
   FILES:=$(LINUX_DIR)/drivers/crypto/inside-secure/eip93/crypto-hw-eip93.ko
   AUTOLOAD:=$(call AutoLoad,09,crypto-hw-eip93)
   $(call AddDepends/crypto)
@@ -1072,6 +1092,7 @@ $(eval $(call KernelPackage,crypto-sha512))
 
 define KernelPackage/crypto-test
   TITLE:=Test CryptoAPI module
+  DEPENDS:=+kmod-crypto-benchmark
   KCONFIG:= \
 	CONFIG_CRYPTO_TEST \
 	CONFIG_CRYPTO_BENCHMARK
