@@ -1,0 +1,37 @@
+From: Tao <gongtao0607@gmail.com>
+Date: Thu, 30 Jul 2026 15:25:00 +0000
+Subject: [PATCH] netfilter: nft_flow_offload: pre-fill VLAN encap info for bridge offload
+
+When L2 bridge flow offload resolves a bridge port VLAN via
+br_vlan_get_offload_info_rcu(), it populates ctx.vlan[0] for the forward
+path discovery walk, but leaves info.num_encaps at 0.
+
+If the forward path subsequently traverses an untagged egress port
+(DEV_PATH_BR_VLAN_UNTAG), the handler attempts to pop the VLAN tag by
+decrementing info.num_encaps. Because info.num_encaps was initialized to 0,
+this triggers WARN_ON_ONCE and underflows the encapsulation counter, causing
+offload path resolution failure or corrupted flowtable entries.
+
+Fix this by pre-filling info.encap[0] with the resolved vlan_id and vlan_proto
+and incrementing info.num_encaps inside nft_dev_forward_path() whenever
+br_vlan_get_offload_info_rcu() returns a valid VLAN ID. This allows
+DEV_PATH_BR_VLAN_UNTAG to cleanly decrement num_encaps from 1 to 0 for
+untagged destination ports, ensuring valid flow offload entries for bridged
+VLAN traffic.
+
+Signed-off-by: Tao <gongtao0607@gmail.com>
+---
+--- a/net/netfilter/nf_flow_table_path.c
++++ b/net/netfilter/nf_flow_table_path.c
+@@ -294,6 +294,11 @@ static int nft_dev_forward_path(const st
+ 			ctx.num_vlans = 1;
+ 			ctx.vlan[0].id = vlan_id;
+ 			ctx.vlan[0].proto = vlan_proto;
++			if (info.num_encaps < NF_FLOW_TABLE_ENCAP_MAX) {
++				info.encap[info.num_encaps].id = vlan_id;
++				info.encap[info.num_encaps].proto = vlan_proto;
++				info.num_encaps++;
++			}
+ 		} else if (skb_vlan_tag_present(pkt->skb)) {
+ 			if (info.num_encaps < NF_FLOW_TABLE_ENCAP_MAX) {
+ 				info.encap[info.num_encaps].id =
