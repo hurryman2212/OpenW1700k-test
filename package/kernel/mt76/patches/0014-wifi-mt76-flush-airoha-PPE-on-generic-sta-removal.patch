@@ -1,0 +1,79 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OpenWrt <noreply@openwrt.org>
+Date: Fri, 31 Jul 2026 00:00:00 +0200
+Subject: [PATCH] wifi: mt76: flush airoha PPE on generic STA removal
+
+Commit c1f6d6ba6f ("airoha: fix WiFi roaming PPE stall") added 0013,
+which calls airoha_ppe_dev_flush_flows_by_mac() from the mt7996-specific
+per-link path mt7996_mac_sta_remove_link().  However that path only runs
+for mt7996 and only for per-link MLO teardown; the generic mt76
+__mt76_sta_remove() callback that drives sta_remove for *all* mt76
+chips does not feed the PPE L2/L4 caches on STA teardown.
+
+When a STA is torn down due to an explicit disconnect (rather than a
+bridge-side FDB port move), mac80211 emits SWITCHDEV_FDB_DEL_TO_DEVICE
+from __sta_info_destroy_part2() (commit 8a6e9740be) which the airoha
+PPE switchdev notifier receives asynchronously and drains the L2 cache
+via airoha_ppe_schedule_flush_by_mac().  Reaching the same drain
+through the mt76 STA-removal path as well reduces the window during
+which a new STA reusing the same MAC could collide with stale PPE L2
+entries, and extends the same coverage to any mt76 chip that does not
+implement a driver-specific sta_remove_link hook.
+
+Add a small inline block in __mt76_sta_remove() that mirrors the
+mt7996_ppe_flush_sta_addr() helper introduced by 0013 (rcu-protected
+dev->mmio.ppe_dev lookup + airoha_ppe_dev_flush_flows_by_mac() inline
+wrapper defined in <linux/soc/airoha/airoha_offload.h> by 930) and
+invoke it immediately after drv->sta_remove returns and before
+mt76_wcid_cleanup() drops the WCID, so the PPE L2 flush is queued
+before the WCID/card state referenced by the flow entries is released.
+
+No new kernel-tree symbols are introduced: this relies entirely on the
+inline wrapper added to <linux/soc/airoha/airoha_offload.h> by patch
+930.  Guard the include with CONFIG_NET_AIROHA_NPU the same way mt76.h
+already guards the airoha_offload.h selection, so non-airoha targets
+compile unchanged.
+
+Signed-off-by: OpenWrt <noreply@openwrt.org>
+---
+--- a/mac80211.c
++++ b/mac80211.c
+@@ -4,6 +4,9 @@
+  */
+ #include <linux/sched.h>
+ #include <linux/of.h>
++#if IS_ENABLED(CONFIG_NET_AIROHA_NPU)
++#include <linux/soc/airoha/airoha_offload.h>
++#endif
+ #include "mt76.h"
+ 
+ static void
+@@ -1630,6 +1633,28 @@ void __mt76_sta_remove(struct mt76_phy *phy, struct ieee80211_vif *vif,
+ 	if (dev->drv->sta_remove)
+ 		dev->drv->sta_remove(dev, vif, sta);
+ 
++#if IS_ENABLED(CONFIG_NET_AIROHA_NPU)
++	/* Drain any PPE L2/L4 entries bound to this STA's MAC before the
++	 * WCID is freed.  Same-BSS disconnect/reconnect often does not
++	 * move the bridge FDB port, so the airoha PPE switchdev notifier
++	 * (which catches SWITCHDEV_FDB_DEL_TO_DEVICE from mac80211) may
++	 * either not fire at all or run asynchronously after the WCID is
++	 * gone.  Calling airoha_ppe_dev_flush_flows_by_mac() here queues
++	 * the L2 flush via eth->fdb_wq on the airoha side; the WCID we
++	 * hold here is not referenced by the queued work (it keys only
++	 * off sta->addr), so dropping wcid below is safe.
++	 */
++	{
++		struct airoha_ppe_dev *ppe_dev;
++
++		rcu_read_lock();
++		ppe_dev = rcu_dereference(dev->mmio.ppe_dev);
++		if (ppe_dev)
++			airoha_ppe_dev_flush_flows_by_mac(ppe_dev, sta->addr);
++		rcu_read_unlock();
++	}
++#endif
++
+ 	mt76_wcid_cleanup(dev, wcid);
+ 
+ 	mt76_wcid_mask_clear(dev->wcid_mask, idx);
