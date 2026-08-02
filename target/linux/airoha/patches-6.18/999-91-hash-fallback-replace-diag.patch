@@ -1,0 +1,31 @@
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c	2026-08-01 21:04:36.619935646 -1000
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c	2026-08-01 21:20:05.203308561 -1000
+@@ -1101,6 +1101,20 @@
+ 	if (commit_done)
+ 		goto unlock;
+ 
++	if (hash == 0) {
++		u32 i, num = airoha_ppe_get_total_num_entries(ppe);
++
++		for (i = 1; i < num; i++) {
++			hlist_for_each_entry_safe(e, n, &ppe->foe_flow[i],
++						  list) {
++				if (e->type == FLOW_TYPE_L4) {
++					airoha_ppe_foe_commit_entry(ppe, &e->data, i, rx_wlan);
++					commit_done = true;
++				}
++			}
++		}
++	}
++
+ 	airoha_ppe_foe_set_bridge_addrs(&br, eth_hdr(skb));
+ 	e = rhashtable_lookup_fast(&ppe->l2_flows, &br,
+ 				   airoha_l2_flow_table_params);
+@@ -1268,6 +1282,7 @@
+ 	if (rhashtable_lookup(&eth->flow_table, &f->cookie,
+ 			      airoha_flow_table_params))
+ 		return -EEXIST;
++	pr_info("DIAG REPLACE cookie=%lx\n", f->cookie);
+ 
+ 	if (!flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_META))
+ 		return -EOPNOTSUPP;
