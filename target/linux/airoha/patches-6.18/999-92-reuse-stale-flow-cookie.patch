@@ -1,0 +1,22 @@
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -1279,10 +1279,15 @@
+	int err, i, offload_type;
+	u16 addr_type = 0;
+ 
+-	if (rhashtable_lookup(&eth->flow_table, &f->cookie,
+-			      airoha_flow_table_params))
+-		return -EEXIST;
+-	pr_info("DIAG REPLACE cookie=%lx\n", f->cookie);
++	e = rhashtable_lookup(&eth->flow_table, &f->cookie,
++			      airoha_flow_table_params);
++	if (e) {
++		airoha_ppe_foe_flow_remove_entry(eth->ppe, e);
++		rhashtable_remove_fast(&eth->flow_table, &e->node,
++				       airoha_flow_table_params);
++		kfree(e);
++		e = NULL;
++	}
+ 
+ 	if (!flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_META))
+ 		return -EOPNOTSUPP;
