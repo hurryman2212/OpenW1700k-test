@@ -1,0 +1,435 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OpenWrt <noreply@openwrt.org>
+Date: Fri, 01 Aug 2026 12:00:00 +0200
+Subject: [PATCH] netfilter + airoha: gen-gate PPE FDB flush and
+ teardown_by_eth
+
+A WiFi STA that disconnects and reconnects in quick succession loses
+hardware offload on the new flow F' because the disconnect's
+deferred cleanup work tears down flows by MAC match without checking
+the cleanup_gen chronometer that 990-01 introduced for this exact
+race:
+
+   T=0      STA disconnects; mac80211 emits SWITCHDEV_FDB_DEL_TO_DEVICE
+            990-01 bumps flow_mac_cleanup_gen 0->1 and schedules
+            nf_flow_table_mac_cleanup_work(gen=1).
+            930 schedules airoha_ppe_fdb_work_handler on eth->fdb_wq.
+            0014 (mt76) and 0013 (mt7996) call
+            airoha_ppe_dev_flush_flows_by_mac() which schedules MORE
+            work on eth->fdb_wq.
+   T=eps    STA reconnects; new flow F' created.
+            flow_offload_add stamps F'->cleanup_gen = atomic_read(...)=1.
+   T=cleanup
+            990-01 nf flowtable work: skips F' (cleanup_gen (1) >= gen
+            (1)); F' SW/HW state preserved.
+            Airoha fdb_work_handler A:
+              airoha_ppe_flush_l2_flows_by_mac() walks l2_flows and
+                unconditionally removes any L2 master whose L2 MAC
+                matches.
+              airoha_ppe_flush_l4_flows_by_mac() walks foe_flow[]
+                and unconditionally removes any L4 entry whose L2
+                rewrite MAC matches -- including F', even though F'
+                was committed AFTER the FDB DEL event.
+              Calls flow_offload_teardown_by_eth(addr) which runs
+              nf_flow_teardown_if_eth() across all flowtables with
+              NO cleanup_gen check, calling flow_offload_teardown(F')
+              and clearing IPS_OFFLOAD_BIT.
+            F' is now in NF_FLOW_TEARDOWN.  Packets fall back to slow
+            path; a fresh offload can only start after GC evicts F',
+            which can take >1s, and stale conntrack state may block
+            re-offload longer.
+
+990-01 already proved the gen-gate pattern: any flow created at or
+after the gen captured by the disconnect's bump must be left alone
+because it is by construction NOT the stale flow the disconnect
+cleanup is meant to drain.  This patch extends the same gate to:
+
+1. The nf_flow_table side: a new flow_offload_teardown_by_eth_gen()
+   variant that takes a u32 gen and skips DIRECT flows whose
+   cleanup_gen is at or after that gen.  flow_offload_teardown_by_eth()
+   becomes a wrapper passing gen=0 (no gate) so external callers
+   that drive teardown from outside the switchdev pipeline (debugfs,
+   future vendor modules) keep doing the broad teardown.
+
+2. The Airoha PPE side: struct airoha_flow_table_entry grows a u32
+   cleanup_gen field (mirroring the existing field on struct
+   flow_offload since 990-01).  airoha_ppe_foe_flow_commit_entry()
+   and airoha_ppe_foe_l2_flow_commit_entry() stamp
+   atomic_read(&flow_mac_cleanup_gen) at commit time, mirroring
+   flow_offload_add()'s stamp on the SW flow side.
+
+3. The Airoha PPE deferred worker
+   (airoha_ppe_fdb_work_handler) reads flow_mac_cleanup_gen at
+   worker-run time (not at schedule time).  The captured gen is
+   passed to both flush walks (so PPE entries whose cleanup_gen >=
+   gen are skipped) and to flow_offload_teardown_by_eth_gen() (so
+   SW flows matching the MAC but stamped at/after this event's gen
+   are not torn down).
+
+Both the L2 walk (airoha_ppe_flush_l2_flows_by_mac) and the L4
+walk (airoha_ppe_flush_l4_flows_by_mac) get a u32 gen parameter
+under #ifdef CONFIG_NET_SWITCHDEV, so the same gate that protects
+SW flows in 990-01 now protects the vendor PPE SW state and its
+HW FOE binds.
+
+The global atomic_t flow_mac_cleanup_gen is moved from
+static-in-nf_flow_table_core.c to a CONFIG_NET_SWITCHDEV-guarded
+extern declared in <net/netfilter/nf_flow_table.h> so the Airoha
+driver can read it; existing references (the bump in the switchdev
+notifier, the stamp in flow_offload_add) remain inside
+IS_ENABLED(CONFIG_NET_SWITCHDEV) blocks so non-switchdev builds are
+unaffected.
+
+Why capture-at-worker rather than capture-at-schedule:
+
+  airoha_ppe_switchdev_event (patch 930) and 990-01's
+  nf_flow_table_switchdev_event are two independent notifier_block
+  registrations on the same SWITCHDEV_FDB_DEL_TO_DEVICE event.
+  The kernel does not order notifier chains between unrelated
+  registrations, so a gen captured at schedule time may read
+  pre-bump (gen=0), silently disabling the gate (gen=0 means "no
+  gate" in the iterators).  By reading the gen in the deferred
+  worker instead, we are guaranteed that 990-01's notifier has
+  already run and bumped the counter: notifier chains are executed
+  synchronously in process/skb context, and the worker is
+  out-of-line work that runs strictly later on eth->fdb_wq.
+
+  The trade-off is over-gating: if several STAs disconnect in
+  quick succession (each bumping gen), only the latest bump is
+  visible to earlier events' workers.  In practice this is
+  harmless -- any flow still alive at the latest gen is by
+  definition stamped with that gen and would be skipped by the
+  gate anyway.  Per-event granularity is lost; correctness is
+  preserved.
+
+The mt76 patch-a (0014) path, the mt7996 0013 path, and the airoha
+switchdev notifier in 930 all funnel through
+airoha_ppe_schedule_flush_by_mac() into the same deferred worker,
+so they all inherit the gen-gate at worker-run time automatically.
+
+This patch does NOT close the smaller TOCTOU window in
+flow_offload_work_add() (the patched NF_FLOW_TEARDOWN check at line
+981 takes a snapshot, then commits the flow; teardown may occur
+between check and commit).  That window is secondary and
+self-healing: a subsequent FLOW_CLS_DESTROY tears down the dying
+flow shortly after, and the brief HW commit is in correct L2
+state so no mis-forwarding occurs.
+
+Signed-off-by: OpenWrt <noreply@openwrt.org>
+---
+
+--- a/include/net/netfilter/nf_flow_table.h
++++ b/include/net/netfilter/nf_flow_table.h
+@@ -320,6 +320,11 @@
+ 
+ void flow_offload_teardown(struct flow_offload *flow);
+ void flow_offload_teardown_by_eth(const u8 *addr);
++void flow_offload_teardown_by_eth_gen(const u8 *addr, u32 gen);
++
++#ifdef CONFIG_NET_SWITCHDEV
++extern atomic_t flow_mac_cleanup_gen;
++#endif
+ 
+ int nf_flow_table_iterate(struct nf_flowtable *flow_table,
+                       void (*iter)(struct nf_flowtable *flowtable,
+--- a/net/netfilter/nf_flow_table_core.c
++++ b/net/netfilter/nf_flow_table_core.c
+@@ -32,7 +32,10 @@
+ };
+ #endif
+ 
+-static atomic_t flow_mac_cleanup_gen;
++#ifdef CONFIG_NET_SWITCHDEV
++atomic_t flow_mac_cleanup_gen;
++EXPORT_SYMBOL_GPL(flow_mac_cleanup_gen);
++#endif
+ 
+ static RAW_NOTIFIER_HEAD(flow_teardown_by_eth_chain);
+ 
+@@ -419,12 +422,29 @@
+ }
+ EXPORT_SYMBOL_GPL(flow_offload_teardown);
+ 
+-static void nf_flow_teardown_if_eth(struct nf_flowtable *flow_table,
+-				    struct flow_offload *flow, void *data)
++struct nf_flow_teardown_by_eth_ctx {
++	const u8 *addr;
++	u32 gen;
++};
++
++static void nf_flow_teardown_if_eth_gen(struct nf_flowtable *flow_table,
++					struct flow_offload *flow, void *data)
+ {
+-	const u8 *addr = data;
++	const struct nf_flow_teardown_by_eth_ctx *ctx = data;
++	const u8 *addr = ctx->addr;
+ 	int dir;
+ 
++	/* Skip flows created at or after the generation that triggered
++	 * this teardown.  They are fresh flows for the same MAC that
++	 * were established AFTER the disconnect event whose address
++	 * prompted this teardown (e.g. PPE L2 cache drain after a
++	 * WiFi STA disconnect), so clobbering them would re-introduce
++	 * the very stall that the disconnect-teardown path exists to
++	 * fix.  See 990-01 for the original cleanup_gen design.
++	 */
++	if (ctx->gen && flow->cleanup_gen >= ctx->gen)
++		return;
++
+ 	for (dir = 0; dir < FLOW_OFFLOAD_DIR_MAX; dir++) {
+ 		struct flow_offload_tuple *t = &flow->tuplehash[dir].tuple;
+ 
+@@ -442,6 +462,13 @@
+ 
+ void flow_offload_teardown_by_eth(const u8 *addr)
+ {
++	flow_offload_teardown_by_eth_gen(addr, 0);
++}
++EXPORT_SYMBOL_GPL(flow_offload_teardown_by_eth);
++
++void flow_offload_teardown_by_eth_gen(const u8 *addr, u32 gen)
++{
++	struct nf_flow_teardown_by_eth_ctx ctx = { .addr = addr, .gen = gen };
+ 	struct nf_flowtable *flowtable;
+ 
+ 	if (!addr || is_zero_ether_addr(addr) ||
+@@ -459,11 +486,11 @@
+ 
+ 	mutex_lock(&flowtable_lock);
+ 	list_for_each_entry(flowtable, &flowtables, list)
+-		nf_flow_table_iterate(flowtable, nf_flow_teardown_if_eth,
+-				      (void *)addr);
++		nf_flow_table_iterate(flowtable, nf_flow_teardown_if_eth_gen,
++				      &ctx);
+ 	mutex_unlock(&flowtable_lock);
+ }
+-EXPORT_SYMBOL_GPL(flow_offload_teardown_by_eth);
++EXPORT_SYMBOL_GPL(flow_offload_teardown_by_eth_gen);
+ 
+ int nf_flow_offload_teardown_by_eth_register_notifier(struct notifier_block *nb)
+ {
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -504,6 +504,22 @@
+ 	struct hlist_node l2_subflow_node; /* PPE L2 subflow entry */
+ 	u32 hash;
+ 
++#ifdef CONFIG_NET_SWITCHDEV
++	/* Generation at the time this flow was committed to the Airoha
++	 * PPE driver SW cache (foe_flow[] or l2_flows).  Pairs with the
++	 * global flow_mac_cleanup_gen from nf_flow_table_core.c and the
++	 * gen captured by airoha_ppe_fdb_work when it is queued from a
++	 * switchdev FDB event or a WiFi STA-removal invocation.  The
++	 * flush-by-MAC walks in 930 (airoha_ppe_flush_l2_flows_by_mac /
++	 * airoha_ppe_flush_l4_flows_by_mac) and the
++	 * flow_offload_teardown_by_eth_gen() flow-table walk all skip
++	 * entries whose cleanup_gen is at or after the captured gen,
++	 * so a NEW flow created after the disconnect event is NOT
++	 * torn down by the delayed cleanup of the disconnect.
++	 */
++	u32 cleanup_gen;
++#endif
++
+ 	struct airoha_foe_stats64 stats;
+ 	enum airoha_flow_entry_type type;
+ 
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -1119,6 +1119,9 @@
+ 	struct airoha_flow_table_entry *prev;
+ 
+ 	e->type = FLOW_TYPE_L2;
++#ifdef CONFIG_NET_SWITCHDEV
++	e->cleanup_gen = atomic_read(&flow_mac_cleanup_gen);
++#endif
+ 	prev = rhashtable_lookup_get_insert_fast(&ppe->l2_flows, &e->l2_node,
+ 						 airoha_l2_flow_table_params);
+ 	if (!prev)
+@@ -1144,6 +1147,9 @@
+ 	hash = airoha_ppe_foe_get_entry_hash(ppe, &e->data);
+ 	e->type = FLOW_TYPE_L4;
+ 	e->hash = 0xffff;
++#ifdef CONFIG_NET_SWITCHDEV
++	e->cleanup_gen = atomic_read(&flow_mac_cleanup_gen);
++#endif
+ 
+ 	spin_lock_bh(&ppe_lock);
+ 	hlist_add_head(&e->list, &ppe->foe_flow[hash]);
+@@ -1512,7 +1518,11 @@
+ }
+ 
+ static bool airoha_ppe_flush_l2_flows_by_mac(struct airoha_eth *eth,
+-					     const u8 *addr)
++					     const u8 *addr
++#ifdef CONFIG_NET_SWITCHDEV
++					     , u32 gen
++#endif
++					     )
+ {
+ 	struct airoha_ppe *ppe = eth->ppe;
+ 	struct airoha_flow_table_entry *e;
+@@ -1524,8 +1534,21 @@
+ 	rhashtable_walk_enter(&ppe->l2_flows, &iter);
+ 	rhashtable_walk_start(&iter);
+ 	while ((e = rhashtable_walk_next(&iter)) != NULL) {
+-		if (!IS_ERR(e) && airoha_ppe_l2_flow_has_mac(e, addr))
+-			hlist_add_head(&e->l2_subflow_node, &to_remove);
++		if (IS_ERR(e))
++			continue;
++		if (!airoha_ppe_l2_flow_has_mac(e, addr))
++			continue;
++#ifdef CONFIG_NET_SWITCHDEV
++		/* Skip L2 master flows created at or after this event's
++		 * captured generation -- they are NEW flows for the same
++		 * MAC established AFTER the disconnect that triggered
++		 * this flush, so removing them would re-introduce the
++		 * very stall we are trying to recover from.
++		 */
++		if (gen && e->cleanup_gen >= gen)
++			continue;
++#endif
++		hlist_add_head(&e->l2_subflow_node, &to_remove);
+ 	}
+ 	rhashtable_walk_stop(&iter);
+ 	rhashtable_walk_exit(&iter);
+@@ -1552,7 +1575,11 @@
+ }
+ 
+ static bool airoha_ppe_flush_l4_flows_by_mac(struct airoha_ppe *ppe,
+-					     const u8 *addr)
++					     const u8 *addr
++#ifdef CONFIG_NET_SWITCHDEV
++					     , u32 gen
++#endif
++					     )
+ {
+ 	u32 sram_num_entries = airoha_ppe_get_total_sram_num_entries(ppe);
+ 	struct airoha_flow_table_entry *e;
+@@ -1563,9 +1590,19 @@
+ 	spin_lock_bh(&ppe_lock);
+ 	for (i = 0; i < sram_num_entries; i++) {
+ 		hlist_for_each_entry(e, &ppe->foe_flow[i], list) {
+-			if (e->type == FLOW_TYPE_L4 &&
+-			    airoha_ppe_l4_flow_has_mac(e, addr))
+-				hlist_add_head(&e->l2_subflow_node, &to_remove);
++			if (e->type != FLOW_TYPE_L4)
++				continue;
++			if (!airoha_ppe_l4_flow_has_mac(e, addr))
++				continue;
++#ifdef CONFIG_NET_SWITCHDEV
++			/* Skip L4 flows created at or after this event's
++			 * captured generation; see comment in
++			 * airoha_ppe_flush_l2_flows_by_mac().
++			 */
++			if (gen && e->cleanup_gen >= gen)
++				continue;
++#endif
++			hlist_add_head(&e->l2_subflow_node, &to_remove);
+ 		}
+ 	}
+ 	spin_unlock_bh(&ppe_lock);
+@@ -1590,36 +1627,99 @@
+ {
+ 	struct airoha_ppe_fdb_work *w = container_of(work, struct airoha_ppe_fdb_work,
+ 						     work);
++#ifdef CONFIG_NET_SWITCHDEV
++	/* Read flow_mac_cleanup_gen here, in the deferred worker, rather
++	 * than capturing it in airoha_ppe_schedule_flush_by_mac() at
++	 * schedule time.  At schedule time there is no guaranteed
++	 * ordering between this driver's switchdev notifier
++	 * (airoha_ppe_switchdev_event, patch 930) and 990-01's
++	 * nf_flow_table_switchdev_event -- they are two independent
++	 * notifier_block registrations on the same switchdev event,
++	 * so a gen captured at schedule time could read pre-bump (0)
++	 * and the gate would silently disable itself (gen=0 means
++	 * "no gate" in the iterator).
++	 *
++	 * At worker-run time, by contrast, both notifiers have long
++	 * since completed (notifier chains run synchronously in
++	 * process/skb context; deferred work runs later out-of-line
++	 * on eth->fdb_wq).  So any 990-01 bump that was going to
++	 * happen for the triggering FDB DEL has already happened, and
++	 * the read here returns a value that any flow F' created
++	 * *after* the disconnect already stamped into its
++	 * flow_offload->cleanup_gen via 990-01's
++	 * flow_offload_add() path.
++	 *
++	 * The cost of reading-at-worker instead of capturing-at-
++	 * schedule is over-gating: if several STAs disconnect in
++	 * succession (each bumping gen), the worker for the earliest
++	 * event sees the latest (highest) gen and may skip flows that
++	 * the earlier event alone would have torn down.  In practice
++	 * this is harmless -- any flow still alive at the latest gen
++	 * is by definition at that gen and would have been skipped by
++	 * the gate anyway.
++	 */
++	u32 gen = atomic_read(&flow_mac_cleanup_gen);
++	void (*teardown_by_eth_gen)(const u8 *addr, u32 gen);
++#else
+ 	void (*teardown_by_eth)(const u8 *addr);
++#endif
+ 	bool l4_removed;
+ 	bool l2_removed;
+ 
+ 	mutex_lock(&flow_offload_mutex);
+ 	if (rcu_access_pointer(w->eth->npu)) {
+-		l2_removed = airoha_ppe_flush_l2_flows_by_mac(w->eth, w->addr);
++		l2_removed = airoha_ppe_flush_l2_flows_by_mac(w->eth, w->addr
++#ifdef CONFIG_NET_SWITCHDEV
++							      , gen
++#endif
++							      );
+ 		l4_removed = airoha_ppe_flush_l4_flows_by_mac(w->eth->ppe,
+-							      w->addr);
++							      w->addr
++#ifdef CONFIG_NET_SWITCHDEV
++							      , gen
++#endif
++							      );
+ 		mutex_unlock(&flow_offload_mutex);
+ 
+ 		if (l2_removed || l4_removed) {
+-			teardown_by_eth = symbol_get(flow_offload_teardown_by_eth);
+-			if (teardown_by_eth) {
++#ifdef CONFIG_NET_SWITCHDEV
++			teardown_by_eth_gen = symbol_get(flow_offload_teardown_by_eth_gen);
++			if (teardown_by_eth_gen) {
+ 				/* Set the in-flight guard so our own
+ 				 * airoha_ppe_teardown_by_eth_notifier()
+ 				 * (invoked synchronously by
+-				 * flow_offload_teardown_by_eth()) does
++				 * flow_offload_teardown_by_eth_gen()) does
+ 				 * not queue another round of L2/L4
+ 				 * flush work for the same MAC we
+ 				 * just finished draining.  Redundant
+ 				 * work on the single-threaded
+ 				 * eth->fdb_wq would also re-acquire
+ 				 * flow_offload_mutex twice per event.
++				 *
++				 * Pass the gen captured above so the
++				 * gen-aware flowtable walk skips SW
++				 * flows that were created after the
++				 * FDB/STA event (e.g. a flow F'
++				 * created by a STA reconnecting
++				 * before this delayed handler
++				 * finished), matching the
++				 * cleanup_gen-aware behaviour of the
++				 * original 990-01 path.
+ 				 */
+ 				w->eth->teardown_in_flight = true;
++				teardown_by_eth_gen(w->addr, gen);
++				w->eth->teardown_in_flight = false;
++				symbol_put(flow_offload_teardown_by_eth_gen);
++			}
++#else
++			teardown_by_eth = symbol_get(flow_offload_teardown_by_eth);
++			if (teardown_by_eth) {
++				w->eth->teardown_in_flight = true;
+ 				teardown_by_eth(w->addr);
+ 				w->eth->teardown_in_flight = false;
+ 				symbol_put(flow_offload_teardown_by_eth);
+ 			}
++#endif
+ 		}
+ 	} else {
+ 		mutex_unlock(&flow_offload_mutex);
