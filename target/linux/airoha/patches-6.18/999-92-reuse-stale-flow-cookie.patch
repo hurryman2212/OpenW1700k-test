@@ -1,8 +1,8 @@
 --- a/drivers/net/ethernet/airoha/airoha_ppe.c
 +++ b/drivers/net/ethernet/airoha/airoha_ppe.c
-@@ -1279,10 +1279,15 @@
-	int err, i, offload_type;
-	u16 addr_type = 0;
+@@ -1347,10 +1347,38 @@
+ 	int err, i, offload_type;
+ 	u16 addr_type = 0;
  
 -	if (rhashtable_lookup(&eth->flow_table, &f->cookie,
 -			      airoha_flow_table_params))
@@ -13,10 +13,33 @@
 +	if (e) {
 +		airoha_ppe_foe_flow_remove_entry(eth->ppe, e);
 +		rhashtable_remove_fast(&eth->flow_table, &e->node,
-+				       airoha_flow_table_params);
++			       airoha_flow_table_params);
 +		kfree(e);
 +		e = NULL;
 +	}
++#ifdef CONFIG_NET_SWITCHDEV
++	/* DIAG (999-92): visibility on the FLOW_CLS_REPLACE path.
++	 * Throttle to 1/s; reports count of replace events in the
++	 * last 1 s window plus how many found a stale cookie.  A
++	 * non-zero stale count means the SW flow_offload core
++	 * recycled a cookie this driver still had on record.
++	 */
++	{
++		static unsigned long diag_replace_last;
++		static u32 diag_replace_count, diag_replace_stale;
++
++		diag_replace_count++;
++		if (e != NULL)
++			diag_replace_stale++;
++		if (time_after(jiffies, diag_replace_last + HZ)) {
++			pr_info("DIAG REPLACE: %u/s stale=%u\n",
++				diag_replace_count, diag_replace_stale);
++			diag_replace_last = jiffies;
++			diag_replace_count = 0;
++			diag_replace_stale = 0;
++		}
++	}
++#endif
  
  	if (!flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_META))
  		return -EOPNOTSUPP;

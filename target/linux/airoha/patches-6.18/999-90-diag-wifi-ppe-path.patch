@@ -30,7 +30,88 @@
  		e->hash = hash;
  	}
  
-@@ -1454,6 +1477,29 @@
+@@ -1117,6 +1140,31 @@
+ #ifdef CONFIG_NET_SWITCHDEV
+ 	e->cleanup_gen = atomic_read(&flow_mac_cleanup_gen);
+ #endif
++#ifdef CONFIG_NET_SWITCHDEV
++	/* DIAG (999-90): a NEW L2 bridge flow is being armed on the
++	 * SW side.  L2 entries live in the ppe->l2_flows rhashtable
++	 * (not foe_flow[hash]) and have no HW FOE slot of their own;
++	 * they gravitate to HW via subflow commits in
++	 * airoha_ppe_check_skb -> airoha_ppe_foe_commit_subflow.
++	 * Throttle to one log line per second; the line reports the
++	 * count of L2 SW commits in the last 1 s window plus the most
++	 * recent gen/ib1.
++	 */
++	{
++		static unsigned long diag_swcommit_l2_last;
++		static u32 diag_swcommit_l2_count;
++
++		diag_swcommit_l2_count++;
++		if (time_after(jiffies,
++			       diag_swcommit_l2_last + HZ)) {
++			pr_info("DIAG SWCOMMIT L2: %u/s gen=%u ib1=0x%08x\n",
++				diag_swcommit_l2_count,
++				e->cleanup_gen, e->data.ib1);
++			diag_swcommit_l2_last = jiffies;
++			diag_swcommit_l2_count = 0;
++		}
++	}
++#endif
+ 	prev = rhashtable_lookup_get_insert_fast(&ppe->l2_flows, &e->l2_node,
+ 						 airoha_l2_flow_table_params);
+ 	if (!prev)
+@@ -1141,16 +1189,41 @@
+ 
+ 	hash = airoha_ppe_foe_get_entry_hash(ppe, &e->data);
+ 	e->type = FLOW_TYPE_L4;
+-	e->hash = 0xffff;
++ 	e->hash = 0xffff;
+ #ifdef CONFIG_NET_SWITCHDEV
+-	e->cleanup_gen = atomic_read(&flow_mac_cleanup_gen);
++ 	e->cleanup_gen = atomic_read(&flow_mac_cleanup_gen);
++#endif
++ 
++ 	spin_lock_bh(&ppe_lock);
++ 	hlist_add_head(&e->list, &ppe->foe_flow[hash]);
++ 	spin_unlock_bh(&ppe_lock);
++#ifdef CONFIG_NET_SWITCHDEV
++	/* DIAG (999-90): a NEW SW flow_offload entry just got armed --
++	 * added to ppe->foe_flow[hash] with hash=0xffff (no HW FOE
++	 * commit yet; that happens lazily on the next NPU unbind trap
++	 * via airoha_ppe_check_skb -> airoha_ppe_foe_insert_entry).
++	 * Throttle to one log line per second; the line reports the
++	 * count of L4 SW commits in the last 1 s window plus the most
++	 * recent hash/gen/ib1 so we can see whether F' is being armed
++	 * post-reconnect.  Per-commit logging is pure spam during
++	 * sustained吞吐 (hundreds of commits/s) and adds no value.
++	 */
++	{
++		static unsigned long diag_swcommit_last;
++		static u32 diag_swcommit_count;
++
++		diag_swcommit_count++;
++		if (time_after(jiffies, diag_swcommit_last + HZ)) {
++			pr_info("DIAG SWCOMMIT L4: %u/s lasth=0x%04x gen=%u ib1=0x%08x\n",
++				diag_swcommit_count, hash,
++				e->cleanup_gen, e->data.ib1);
++			diag_swcommit_last = jiffies;
++			diag_swcommit_count = 0;
++		}
++	}
+ #endif
+ 
+-	spin_lock_bh(&ppe_lock);
+-	hlist_add_head(&e->list, &ppe->foe_flow[hash]);
+-	spin_unlock_bh(&ppe_lock);
+-
+-	return 0;
++ 	return 0;
+ }
+ 
+ static int airoha_ppe_get_entry_idle_time(struct airoha_ppe *ppe, u32 ib1)
+@@ -1454,6 +1527,29 @@
  	return err;
  }
  
@@ -60,7 +141,7 @@
  static int airoha_ppe_flow_offload_destroy(struct airoha_eth *eth,
  					   struct flow_cls_offload *f)
  {
-@@ -1468,6 +1514,16 @@
+@@ -1468,6 +1564,16 @@
  	rhashtable_remove_fast(&eth->flow_table, &e->node,
  			       airoha_flow_table_params);
  	kfree(e);
@@ -77,7 +158,7 @@
  
  	return 0;
  }
-@@ -1531,17 +1587,25 @@
+@@ -1531,17 +1637,25 @@
  	while ((e = rhashtable_walk_next(&iter)) != NULL) {
  		if (IS_ERR(e))
  			continue;
@@ -104,7 +185,7 @@
  #endif
  		hlist_add_head(&e->l2_subflow_node, &to_remove);
  	}
-@@ -1565,6 +1629,9 @@
+@@ -1565,6 +1679,9 @@
  				       airoha_flow_table_params);
  		kfree(e);
  		removed = true;
@@ -114,7 +195,7 @@
  	}
  	return removed;
  }
-@@ -1587,15 +1654,23 @@
+@@ -1587,15 +1704,23 @@
  		hlist_for_each_entry(e, &ppe->foe_flow[i], list) {
  			if (e->type != FLOW_TYPE_L4)
  				continue;
@@ -139,7 +220,7 @@
  #endif
  			hlist_add_head(&e->l2_subflow_node, &to_remove);
  		}
-@@ -1612,6 +1687,9 @@
+@@ -1612,6 +1737,9 @@
  		rhashtable_remove_fast(&ppe->eth->flow_table, &e->node,
  				       airoha_flow_table_params);
  		kfree(e);
@@ -149,7 +230,7 @@
  	}
  	spin_unlock_bh(&ppe_lock);
  
-@@ -1655,6 +1733,19 @@
+@@ -1655,6 +1783,19 @@
  	 */
  	u32 gen = atomic_read(&flow_mac_cleanup_gen);
  	void (*teardown_by_eth_gen)(const u8 *addr, u32 gen);
@@ -169,7 +250,7 @@
  #else
  	void (*teardown_by_eth)(const u8 *addr);
  #endif
-@@ -1720,6 +1811,70 @@
+@@ -1720,6 +1861,70 @@
  		mutex_unlock(&flow_offload_mutex);
  	}
  
@@ -240,7 +321,7 @@
  	kfree(w);
  }
  
-@@ -1999,6 +2154,21 @@
+@@ -1999,6 +2204,21 @@
  	if (hash > ppe_hash_mask)
  		return;
  
