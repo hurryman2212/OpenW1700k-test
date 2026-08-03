@@ -1,35 +1,56 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OpenWrt <noreply@openwrt.org>
+Date: Sun, 2 Aug 2026 20:00:00 +0000
+Subject: [PATCH] airoha: ppe: evict stale flow_offload cookie on REPLACE + fix stale counter
+
+flow_offload's FLOW_CLS_REPLACE may recycle a cookie that this driver
+still has on record (when the core has not yet propagated its TEARDOWN
+for the prior flow through the notifier chain). In that case
+rhashtable_lookup() returns the existing entry, the old 999-91
+returned -EEXIST, and the new SW arming silently failed -- F' never
+got armed even though SWCOMMIT logs claimed success.
+
+Fix: on REPLACE, if a stale entry exists for this cookie, evict it
+(airoha_ppe_foe_flow_remove_entry + rhashtable_remove + kfree) BEFORE
+adding the new one. DIAG REPLACE counter also fixed: previously
+diag_replace_stale was incremented AFTER e was set to NULL in the
+eviction block, so the counter was permanently 0 and the
+stale-cookie-recycle signal was masked. Sample was_stale BEFORE
+the eviction.
+
+Signed-off-by: OpenWrt <noreply@openwrt.org>
+---
+
 --- a/drivers/net/ethernet/airoha/airoha_ppe.c
 +++ b/drivers/net/ethernet/airoha/airoha_ppe.c
-@@ -1347,10 +1347,38 @@
+@@ -1333,9 +1333,44 @@
  	int err, i, offload_type;
  	u16 addr_type = 0;
  
 -	if (rhashtable_lookup(&eth->flow_table, &f->cookie,
 -			      airoha_flow_table_params))
 -		return -EEXIST;
--	pr_info("DIAG REPLACE cookie=%lx\n", f->cookie);
 +	e = rhashtable_lookup(&eth->flow_table, &f->cookie,
 +			      airoha_flow_table_params);
-+	if (e) {
-+		airoha_ppe_foe_flow_remove_entry(eth->ppe, e);
-+		rhashtable_remove_fast(&eth->flow_table, &e->node,
-+			       airoha_flow_table_params);
-+		kfree(e);
-+		e = NULL;
-+	}
 +#ifdef CONFIG_NET_SWITCHDEV
 +	/* DIAG (999-92): visibility on the FLOW_CLS_REPLACE path.
 +	 * Throttle to 1/s; reports count of replace events in the
 +	 * last 1 s window plus how many found a stale cookie.  A
 +	 * non-zero stale count means the SW flow_offload core
 +	 * recycled a cookie this driver still had on record.
++	 *
++	 * Note: was_stale is sampled BEFORE the eviction block below
++	 * sets e=NULL, otherwise the counter would always read 0 --
++	 * prior revisions had this bug and silently masked the
++	 * stale-cookie-recycle signal.
 +	 */
 +	{
 +		static unsigned long diag_replace_last;
 +		static u32 diag_replace_count, diag_replace_stale;
++		bool was_stale = (e != NULL);
 +
 +		diag_replace_count++;
-+		if (e != NULL)
++		if (was_stale)
 +			diag_replace_stale++;
 +		if (time_after(jiffies, diag_replace_last + HZ)) {
 +			pr_info("DIAG REPLACE: %u/s stale=%u\n",
@@ -40,6 +61,13 @@
 +		}
 +	}
 +#endif
++	if (e) {
++		airoha_ppe_foe_flow_remove_entry(eth->ppe, e);
++		rhashtable_remove_fast(&eth->flow_table, &e->node,
++			       airoha_flow_table_params);
++		kfree(e);
++		e = NULL;
++	}
  
  	if (!flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_META))
  		return -EOPNOTSUPP;

@@ -1,36 +1,286 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OpenWrt <noreply@openwrt.org>
+Date: Sun, 2 Aug 2026 21:30:00 +0000
+Subject: [PATCH] airoha: ppe: fix WiFi hash=0 fallback never firing + slot-flip diag
+
+After WiFi STA roaming/teardown, the NPU traps CPU packets with FOE_ID=0
+in the RX descriptor whenever no FOE entry matches the 5-tuple -- a
+MISS packet. With mt76 patch 0012 ("wifi: mt76: npu: always call
+check_skb on RX") every WiFi MISS packet calls
+airoha_ppe_dev_check_skb(ppe_dev, skb, hash=0, true), so post-reconnect
+~99% of WiFi RX traps with hash=0 until a new FOE entry is committed.
+
+The previous hash=0 fallback added by 999-91 was gated on
+`!hwe && hash == 0` inside airoha_ppe_foe_insert_entry(). It NEVER
+fired because airoha_ppe_foe_get_entry_locked() returns a non-NULL
+pointer even when the HW FOE slot is INVALID. As a result post-
+reconnect the 1% non-zero-hash WiFi packets went through the normal
+commit path (visible as DIAG COMMIT PPE1: 1/s) but the 99% hash=0
+packets walked foe_flow[0] (always empty -- no real 5-tuple hashes to
+slot 0), never found F' living at its real nonzero hash, and never
+committed it to HW FOE. The NPU kept trapping 100k+ pps of MISS to
+CPU; throughput stayed broken until manual disconnect/reconnect.
+
+Fix: handle the WiFi hash=0 MISS case with a dedicated handler
+airoha_ppe_foe_handle_wifi_miss() called BEFORE the per-hash throttle
+in airoha_ppe_check_skb(). The per-hash throttle (foe_check_time[hash])
+starves the fallback to 10/s when 100k+ pps share the hash=0 slot, so
+intercepting it earlier is necessary too. The handler has its own
+global rate limit (10/s) and commits every armed SW L4 flow (F') at
+ITS OWN hash (computed from its 5-tuple in airoha_ppe_foe_flow_commit_entry),
+not at slot 0. Once F' is BIND at its real hash the NPU stops trapping
+that 5-tuple; traffic self-stabilizes.
+
+Add a per-second DIAG FALLBACK counter with these columns:
+  calls=N/s ents=N/s commits=N/s fails=N/s kept=N/s flips=N/s
+  flip2inv=N/s slots[N]=hash1,hash2,...
+Where:
+  - fails: airoha_ppe_foe_commit_entry returned nonzero (SRAM ack timeout)
+  - kept:  HW slot ib1 unchanged from last fallback call
+  - flips: HW slot ib1 mutated between fallback calls (someone else writing)
+  - flip2inv: mutation was BIND->INVALID (subset of flips; the smoking gun
+              for 999-92 stale-cookie eviction racing against our commit)
+  - slots[8]: a sample of up to 8 distinct hash slots we touched this 1s
+
+Signed-off-by: OpenWrt <noreply@openwrt.org>
+---
+
 --- a/drivers/net/ethernet/airoha/airoha_ppe.c
 +++ b/drivers/net/ethernet/airoha/airoha_ppe.c
-@@ -1066,6 +1066,25 @@
- 	spin_lock_bh(&ppe_lock);
+@@ -2194,6 +2229,219 @@
+ 	return err;
+ }
  
- 	hwe = airoha_ppe_foe_get_entry_locked(ppe, hash);
-+	if (!hwe && hash == 0) {
-+		u32 i, num = airoha_ppe_get_total_num_entries(ppe);
-+		bool hit_slot0 = false;
++/* WiFi MISS packets: the NPU traps a packet to CPU with FOE_ID=0 in
++ * the RX descriptor when no FOE entry matches the 5-tuple.  After a
++ * WiFi roaming/STA-reconnect event, the previous FOE entry for that
++ * 5-tuple was torn down (state=INVALID), so nearly every packet for
++ * that flow traps with hash=0 until a new entry is committed.
++ *
++ * The per-hash throttle in airoha_ppe_check_skb (foe_check_time[hash])
++ * would starve this path -- all hash=0 packets share a single slot,
++ * capping the fallback to ~10 calls/s even when 100k pps trap.  This
++ * dedicated handler runs BEFORE the per-hash throttle and uses its
++ * own global rate limit (10/s) so we don't burn CPU iterating the
++ * whole foe_flow[] table at packet rate.
++ *
++ * The fallback walks all foe_flow[i] slots looking for armed SW L4
++ * flows (F') that have not yet been committed to HW FOE, and commits
++ * each at its OWN hash (the one computed from its 5-tuple).  Once F'
++ * is BIND in HW FOE at its real hash, the NPU stops trapping that
++ * 5-tuple with hash=0 (it instead reports the real BIND hash).
++ *
++ * The previous (now-removed) in-airoha_ppe_foe_insert_entry fallback
++ * was gated on `!hwe && hash == 0` which NEVER fired because
++ * airoha_ppe_foe_get_entry_locked() returns a non-NULL pointer even
++ * when the HW FOE slot is INVALID.  That left 99% of post-reconnect
++ * WiFi packets walking foe_flow[0] which is empty (no real flow hashes
++ * to slot 0), so F' (living at a nonzero hash) was never found and
++ * never committed.
++ */
++static void airoha_ppe_foe_handle_wifi_miss(struct airoha_ppe *ppe,
++					   struct sk_buff *skb)
++{
++	static unsigned long last_run;
++#ifdef CONFIG_NET_SWITCHDEV
++	static unsigned long diag_last;
++	static u32 diag_calls, diag_ents, diag_commits;
++	/* DIAG (999-91 slot flips): per-slot cache of the IB1 we last
++	 * committed at this hash, so on the next fallback call we can
++	 * detect whether the HW slot was mutated between our writes.
++	 *
++	 *   - last_ib1_by_hash[i] == 0xFFFFFFFF  : never committed
++	 *   - last_ib1_by_hash[i] == <our ib1>    : slot still BIND
++	 *   - last_ib1_by_hash[i] != <our ib1>   : slot was MUTATED
++	 *                                            (typically invalidated)
++	 *
++	 * counters per 1s window:
++	 *   diag_kept      : last_ib1 == cur, slot still has our BIND
++	 *   diag_flips     : last_ib1 != cur, slot was mutated
++	 *   diag_flips_inv : mutation was ->INVALID (subset of flips)
++	 *   diag_submit_err: commit_entry returned nonzero (SRAM ack timeout)
++	 *
++	 * If diag_flips ~ diag_commits and diag_flips_inv > 0: something
++	 * is invalidating HW slots faster than we re-commit -> the
++	 * 999-92 REPLACE-eviction hypothesis is confirmed.
++	 * If diag_kept ~ diag_commits but NPU keeps missing: the NPU
++	 * is failing to pick up BIND entries we wrote -> NPU FW sync.
++	 * If diag_submit_err > 0: SRAM commit itself failing.
++	 */
++	static u32 *last_ib1_by_hash = NULL;
++	static u32 last_ib1_size = 0;
++	static u32 diag_kept, diag_flips, diag_flips_inv, diag_submit_err;
++	/* also log a sample of up to 8 distinct slot hashes we touched */
++	static u32 diag_slots_logged[8];
++	static u32 diag_slots_n;
++#endif
++	u32 i, num = airoha_ppe_get_total_num_entries(ppe);
 +
-+		for (i = 1; i < num; i++) {
-+			hlist_for_each_entry_safe(e, n, &ppe->foe_flow[i],
-+						  list) {
-+				if (e->type == FLOW_TYPE_L4) {
-+					airoha_ppe_foe_commit_entry(ppe, &e->data, i, rx_wlan);
-+					commit_done = true;
-+					if (!hit_slot0) {
-+						airoha_ppe_foe_commit_entry(ppe, &e->data, 0, rx_wlan);
-+						hit_slot0 = true;
-+					}
++	(void)skb; /* kept for future 5-tuple-match optimization */
++
++	/* Global fallback throttle: 10/s.  Self-stabilizing -- once F'
++	 * is committed for a 5-tuple, the NPU stops trapping hash=0 for
++	 * that flow, so the miss rate drops to zero in steady state.
++	 */
++	if (!time_after(jiffies, last_run + HZ / 10))
++		return;
++	last_run = jiffies;
++
++#ifdef CONFIG_NET_SWITCHDEV
++	diag_calls++;
++	if (!last_ib1_by_hash || last_ib1_size < num) {
++		/* we run from softirq/NAPI context (mt76 RX -> check_skb),
++		 * so GFP_ATOMIC is mandatory; kmalloc_array with
++		 * GFP_ATOMIC can fail silently and we keep last_ib1_size=0
++		 * -- the diag just becomes a no-op in that case.
++		 */
++		u32 *new_arr = kmalloc_array(num, sizeof(u32),
++					     GFP_ATOMIC | __GFP_ZERO);
++		if (new_arr) {
++			kfree(last_ib1_by_hash);
++			last_ib1_by_hash = new_arr;
++			last_ib1_size = num;
++			/* mark all entries "never committed" */
++			for (i = 0; i < num; i++)
++				last_ib1_by_hash[i] = 0xFFFFFFFFU;
++			diag_slots_n = 0;
++		}
++	}
++#endif
++
++	spin_lock_bh(&ppe_lock);
++	for (i = 1; i < num; i++) {
++		struct airoha_flow_table_entry *e;
++		struct hlist_node *n;
++		struct airoha_foe_entry *hwe;
++
++		hlist_for_each_entry_safe(e, n, &ppe->foe_flow[i], list) {
++			int err;
++#ifdef CONFIG_NET_SWITCHDEV
++			u32 cur_ib1 = 0, last_ib1 = 0;
++			u32 state;
++			bool has_last;
++#endif
++
++			if (e->type != FLOW_TYPE_L4)
++				continue;
++
++#ifdef CONFIG_NET_SWITCHDEV
++			/* read the CURRENT HW slot ib1 BEFORE we commit.
++			 * hwe may legitimately be NULL on SRAM read
++			 * timeout; treat as unknown.
++			 *
++			 * Mask out the timestamp bits (bits 0-14) since
++			 * airoha_ppe_foe_commit_entry refreshes them on
++			 * every commit -- we want to detect BIND->INVALID
++			 * mutations by other code paths, not timestamp
++			 * updates by ourselves.
++			 */
++			hwe = airoha_ppe_foe_get_entry_locked(ppe, i);
++			if (hwe)
++				cur_ib1 = hwe->ib1 &
++					~AIROHA_FOE_IB1_BIND_TIMESTAMP;
++			has_last = last_ib1_by_hash &&
++				   last_ib1_by_hash[i] != 0xFFFFFFFFU;
++			if (has_last)
++				last_ib1 = last_ib1_by_hash[i];
++#endif
++			err = airoha_ppe_foe_commit_entry(ppe, &e->data, i, true);
++			e->hash = i;
++#ifdef CONFIG_NET_SWITCHDEV
++			diag_ents++;
++			diag_commits++;
++			if (err)
++				diag_submit_err++;
++			if (has_last) {
++				if (cur_ib1 == last_ib1)
++					diag_kept++;
++				else {
++					diag_flips++;
++					state = FIELD_GET(
++						AIROHA_FOE_IB1_BIND_STATE,
++						cur_ib1);
++					if (state ==
++					    AIROHA_FOE_STATE_INVALID)
++						diag_flips_inv++;
 +				}
 +			}
++			/* snapshot the post-commit ib1 (timestamp masked
++			 * out) for next round's comparison.
++			 */
++			if (last_ib1_by_hash) {
++				hwe = airoha_ppe_foe_get_entry_locked(ppe, i);
++				if (hwe)
++					last_ib1_by_hash[i] = hwe->ib1 &
++						~AIROHA_FOE_IB1_BIND_TIMESTAMP;
++				else
++					last_ib1_by_hash[i] = e->data.ib1 &
++						~AIROHA_FOE_IB1_BIND_TIMESTAMP;
++			}
++			/* record up to 8 distinct slot hashes */
++			if (diag_slots_n < 8) {
++				u16 k;
++				bool seen = false;
++				for (k = 0; k < diag_slots_n; k++)
++					if (diag_slots_logged[k] == i) {
++						seen = true;
++						break;
++					}
++				if (!seen)
++					diag_slots_logged[diag_slots_n++] = i;
++			}
++#else
++			(void)err;
++			(void)hwe;
++#endif
 +		}
-+		goto unlock;
 +	}
- 	if (!hwe)
- 		goto unlock;
++	spin_unlock_bh(&ppe_lock);
++
++#ifdef CONFIG_NET_SWITCHDEV
++	if (time_after(jiffies, diag_last + HZ)) {
++		char slots_buf[64];
++		u16 k, off = 0;
++
++		for (k = 0; k < diag_slots_n && off < sizeof(slots_buf) - 8;
++		     k++)
++			off += scnprintf(slots_buf + off,
++					 sizeof(slots_buf) - off,
++					 "%s0x%x", k ? "," : "",
++					 diag_slots_logged[k]);
++		slots_buf[off] = 0;
++
++		pr_info("DIAG FALLBACK: calls=%u/s ents=%u/s commits=%u/s "
++			"fails=%u/s kept=%u/s flips=%u/s flip2inv=%u/s "
++			"slots[%u]=%s\n",
++			diag_calls, diag_ents, diag_commits,
++			diag_submit_err, diag_kept, diag_flips,
++			diag_flips_inv, diag_slots_n, slots_buf);
++		diag_last = jiffies;
++		diag_calls = diag_ents = diag_commits = 0;
++		diag_submit_err = diag_kept = diag_flips = diag_flips_inv = 0;
++		diag_slots_n = 0;
++	}
++#endif
++}
++
+ void airoha_ppe_check_skb(struct airoha_ppe_dev *dev, struct sk_buff *skb,
+ 			  u16 hash, bool rx_wlan)
+ {
+@@ -2219,6 +2467,16 @@
+ 		}
+ 	}
  
-@@ -1336,6 +1355,7 @@
- 	if (rhashtable_lookup(&eth->flow_table, &f->cookie,
- 			      airoha_flow_table_params))
- 		return -EEXIST;
-+	pr_info("DIAG REPLACE cookie=%lx\n", f->cookie);
- 
- 	if (!flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_META))
- 		return -EOPNOTSUPP;
++	/* Intercept hash=0 WiFi MISS traps before the per-hash throttle:
++	 * they share one throttle slot and would be starved to 10/s even
++	 * during 100k+ pps miss floods.  The dedicated handler has its
++	 * own global rate limit.
++	 */
++	if (rx_wlan && hash == 0) {
++		airoha_ppe_foe_handle_wifi_miss(ppe, skb);
++		return;
++	}
++
+ 	now = (u16)jiffies;
+ 	diff = now - ppe->foe_check_time[hash];
+ 	if (diff < HZ / 10)
