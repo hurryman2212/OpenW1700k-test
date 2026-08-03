@@ -1,0 +1,56 @@
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -1693,18 +1693,6 @@
+ #ifdef CONFIG_NET_SWITCHDEV
+ 		atomic_inc(&diag_l2_match);
+ #endif
+-#ifdef CONFIG_NET_SWITCHDEV
+-		/* Skip L2 master flows created at or after this event's
+-		 * captured generation -- they are NEW flows for the same
+-		 * MAC established AFTER the disconnect that triggered
+-		 * this flush, so removing them would re-introduce the
+-		 * very stall we are trying to recover from.
+-		 */
+-		if (gen && e->cleanup_gen >= gen) {
+-			atomic_inc(&diag_l2_gen_skip);
+-			continue;
+-		}
+-#endif
+ 		hlist_add_head(&e->l2_subflow_node, &to_remove);
+ 	}
+ 	rhashtable_walk_stop(&iter);
+@@ -1760,16 +1748,6 @@
+ #ifdef CONFIG_NET_SWITCHDEV
+ 			atomic_inc(&diag_l4_match);
+ #endif
+-#ifdef CONFIG_NET_SWITCHDEV
+-			/* Skip L4 flows created at or after this event's
+-			 * captured generation; see comment in
+-			 * airoha_ppe_flush_l2_flows_by_mac().
+-			 */
+-			if (gen && e->cleanup_gen >= gen) {
+-				atomic_inc(&diag_l4_gen_skip);
+-				continue;
+-			}
+-#endif
+ 			hlist_add_head(&e->l2_subflow_node, &to_remove);
+ 		}
+ 	}
+@@ -1866,6 +1844,17 @@
+ 		mutex_unlock(&flow_offload_mutex);
+ 
+ 		if (l2_removed || l4_removed) {
++			{
++				int n;
++
++				for (n = 0; n < w->eth->soc->num_ppe; n++) {
++					airoha_fe_wr(w->eth,
++						     REG_PPE_HASH_SEED(n),
++						     PPE_HASH_SEED);
++					pr_info("DIAG HASESEED PPE%u: rewrote=0x%08x\n",
++						n + 1, PPE_HASH_SEED);
++				}
++			}
+ #ifdef CONFIG_NET_SWITCHDEV
+ 			teardown_by_eth_gen = symbol_get(flow_offload_teardown_by_eth_gen);
+ 			if (teardown_by_eth_gen) {
